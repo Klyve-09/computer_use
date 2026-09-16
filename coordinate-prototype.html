@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Disposable prototype — monitor coordinates</title>
+<style>
+body{font:16px/1.5 system-ui;margin:40px auto;max-width:1000px;padding:0 24px;color:#172529;background:#f5f7f6}h1{line-height:1.15}small{color:#4f6765}section{background:white;padding:22px;margin:18px 0;border:1px solid #d6e1dd;border-radius:8px}button{padding:10px 14px;margin:4px;border:1px solid #739b8e;border-radius:5px;background:white;color:#164d3c;cursor:pointer}button[aria-selected=true]{background:#164d3c;color:white}button:disabled{opacity:.45;cursor:default}table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:8px;border-bottom:1px solid #eee}.result{white-space:pre-wrap;background:#ecf4ef;padding:14px}label{display:inline-block;margin:8px}input{width:80px;padding:6px}dl{display:grid;grid-template-columns:170px 1fr}dt{font-weight:600}dd{margin:0}#steps button{display:block}code{font-size:14px}
+</style>
+<small>DISPOSABLE DESIGN PROTOTYPE · NO REAL INPUT IS SENT</small>
+<h1>From a screenshot to the right monitor</h1>
+<p>Question: can monitor-local screenshot coordinates describe mixed-scale layouts and cross-monitor drags while rejecting observations made before a display change? This simulation assumes screenshots are already oriented as displayed. It does not prove compositor input behavior.</p>
+<section><h2>Current state</h2><div id="state"></div><p class="result" id="result" aria-live="polite"></p></section>
+<section><h2>Explore freely</h2><p>Coordinates below are pixels in the selected monitor's returned screenshot, not desktop coordinates.</p>
+<label>Monitor <select id="monitor"><option>laptop</option><option>left</option><option>portrait</option></select></label>
+<label>X <input id="x" type="number" value="640"></label><label>Y <input id="y" type="number" value="360"></label><br>
+<button onclick="takeObservation()">Observe selected monitor</button><button onclick="clickPoint()">Simulate click</button><button onclick="changeLayout()">Change scale and placement</button><button onclick="restoreLayout()">Restore original layout</button><button onclick="disconnect()">Disconnect left monitor</button><button onclick="drag()">Drag laptop → left monitor</button><button onclick="reset()">Reset</button></section>
+<section><h2>Guided walkthroughs</h2><div id="tabs" role="tablist"></div><p id="description"></p><div id="steps"></div></section>
+<script id="model">
+// Disposable design model. Geometry comes from oriented captures, not raw panel modes.
+const initialMonitors=()=>[
+ {id:'laptop',x:0,y:0,width:2048,height:1152,scale:1.25,imageWidth:2560,imageHeight:1440,orientation:'normal'},
+ {id:'left',x:-1920,y:0,width:1920,height:1080,scale:2,imageWidth:3840,imageHeight:2160,orientation:'normal'},
+ {id:'portrait',x:2048,y:-400,width:1080,height:1920,scale:1,imageWidth:1080,imageHeight:1920,orientation:'90 degrees'}
+];
+const newState=()=>({generation:1,monitors:initialMonitors(),observations:{},result:'Ready. Observe a monitor before acting.'});
+function observe(state,id){
+ const monitor=state.monitors.find(m=>m.id===id);
+ if(!monitor)throw Error('Monitor is disconnected. Refresh the monitor list.');
+ return {generation:state.generation,monitor:{...monitor}};
+}
+function point(state,observation,x,y){
+ if(!observation)throw Error('No observation. Observe the target monitor first.');
+ if(observation.generation!==state.generation)throw Error('Display configuration changed. No input sent; observe again.');
+ const m=observation.monitor;
+ if(!state.monitors.some(current=>current.id===m.id))throw Error('Monitor disconnected. No input sent.');
+ if(!Number.isFinite(x)||!Number.isFinite(y)||x<0||y<0||x>=m.imageWidth||y>=m.imageHeight)throw Error('Point is outside the screenshot. No input sent.');
+ return {x:m.x+x*m.width/m.imageWidth,y:m.y+y*m.height/m.imageHeight};
+}
+function dragEndpoints(state,source,destination){
+ // Resolve both before emitting any input. Interpolation is a backend concern.
+ return {start:point(state,state.observations[source.id],source.x,source.y),end:point(state,state.observations[destination.id],destination.x,destination.y)};
+}
+</script>
+<script>
+let state=newState(),selectedScenario=0,stepIndex=0;
+const $=id=>document.getElementById(id);
+function render(){
+ $('state').innerHTML=`<dl><dt>Display generation</dt><dd>${state.generation}</dd><dt>Observations</dt><dd>${Object.entries(state.observations).map(([id,o])=>`${id}: generation ${o.generation}${o.generation===state.generation?' (current)':' (stale)'}`).join(', ')||'None'}</dd></dl><table><thead><tr><th>Monitor</th><th>Desktop origin</th><th>Logical extent</th><th>Scale / orientation</th><th>Screenshot</th></tr></thead><tbody>${state.monitors.map(m=>`<tr><td>${m.id}</td><td>${m.x}, ${m.y}</td><td>${m.width} × ${m.height}</td><td>${m.scale} / ${m.orientation}</td><td>${m.imageWidth} × ${m.imageHeight}</td></tr>`).join('')}</tbody></table>`;
+ $('result').textContent=state.result;
+}
+function run(fn){try{state.result=fn()}catch(e){state.result=e.message}render()}
+function takeObservation(id=$('monitor').value){run(()=>{state.observations[id]=observe(state,id);return `Observed ${id} at display generation ${state.generation}.`})}
+function clickPoint(id=$('monitor').value,x=Number($('x').value),y=Number($('y').value)){run(()=>{const p=point(state,state.observations[id],x,y);return `Simulated click on ${id}: screenshot (${x}, ${y}) → desktop (${p.x}, ${p.y}).\nReal implementation must return a new screenshot after the action.`})}
+function changeLayout(){state.generation++;const m=state.monitors.find(m=>m.id==='left');if(m){m.scale=1.5;m.width=2560;m.height=1440;m.x=-2560}state.result='Scale and placement changed. Previous observations are stale.';render()}
+function restoreLayout(){state.generation++;state.monitors=initialMonitors();state.result='Original geometry restored, but the generation advanced. Old observations remain stale.';render()}
+function disconnect(){state.generation++;state.monitors=state.monitors.filter(m=>m.id!=='left');state.result='Left monitor disconnected. Previous observations are stale.';render()}
+function drag(){run(()=>{const p=dragEndpoints(state,{id:'laptop',x:1280,y:720},{id:'left',x:1920,y:1080});return `Simulated cross-monitor drag:\nStart (${p.start.x}, ${p.start.y}) → End (${p.end.x}, ${p.end.y}).\nBoth endpoints were checked before any simulated input.`})}
+function reset(){state=newState();render()}
+const scenarios=[
+ {title:'Mixed scales',description:'The laptop uses 125% scale and the left monitor 200%. Each screenshot maps into its own logical extent.',steps:[['Observe laptop',()=>takeObservation('laptop')],['Click its center',()=>clickPoint('laptop',1280,720)],['Observe left monitor',()=>takeObservation('left')],['Click its center',()=>clickPoint('left',1920,1080)]]},
+ {title:'Rotated display',description:'An upright portrait screenshot already includes rotation. Applying rotation again would target the wrong point.',steps:[['Observe portrait monitor',()=>takeObservation('portrait')],['Click its center',()=>clickPoint('portrait',540,960)],['Try an out-of-bounds point',()=>clickPoint('portrait',1080,1920)]]},
+ {title:'Changed and restored',description:'Even if the same geometry returns, an observation from before a display change must not authorize an action.',steps:[['Observe left monitor',()=>takeObservation('left')],['Change display setup',changeLayout],['Restore original setup',restoreLayout],['Attempt old click',()=>clickPoint('left',1920,1080)],['Observe again',()=>takeObservation('left')],['Retry click',()=>clickPoint('left',1920,1080)]]},
+ {title:'Cross-monitor drag',description:'Both ends need current observations. A disconnected destination must reject the whole drag before input starts.',steps:[['Observe laptop',()=>takeObservation('laptop')],['Observe left monitor',()=>takeObservation('left')],['Drag between monitors',drag],['Disconnect destination',disconnect],['Retry the drag',drag]]}
+];
+function selectScenario(i){selectedScenario=i;stepIndex=0;reset();$('description').textContent=scenarios[i].description;renderSteps();$('tabs').innerHTML=scenarios.map((s,j)=>`<button role="tab" aria-selected="${j===i}" onclick="selectScenario(${j})">${s.title}</button>`).join('')}
+function renderSteps(){$('steps').innerHTML=scenarios[selectedScenario].steps.map(([label],i)=>`<button ${i!==stepIndex?'disabled':''} onclick="advance()">${i<stepIndex?'✓':i+1} · ${label}</button>`).join('')}
+function advance(){scenarios[selectedScenario].steps[stepIndex][1]();stepIndex++;renderSteps()}
+selectScenario(0);
+</script></html>
