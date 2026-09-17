@@ -119,7 +119,8 @@ pub async fn monitors() -> Result<Vec<Monitor>, BackendError> {
         "hyprctl monitors",
     )
     .await?;
-    serde_json::from_slice(&out).map_err(|e| BackendError::Failed(format!("hyprctl monitors parse: {e}")))
+    serde_json::from_slice(&out)
+        .map_err(|e| BackendError::Failed(format!("hyprctl monitors parse: {e}")))
 }
 
 /// Capture one monitor as PNG via `grim -o <name> -t png -`.
@@ -132,7 +133,11 @@ pub async fn capture(monitor: &str) -> Result<Vec<u8>, BackendError> {
     .await
 }
 
-async fn run(cmd: &mut Command, timeout: Duration, what: &'static str) -> Result<Vec<u8>, BackendError> {
+async fn run(
+    cmd: &mut Command,
+    timeout: Duration,
+    what: &'static str,
+) -> Result<Vec<u8>, BackendError> {
     let child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -152,7 +157,9 @@ async fn run(cmd: &mut Command, timeout: Duration, what: &'static str) -> Result
             out.status,
             String::from_utf8_lossy(&out.stderr).trim()
         ))),
-        Ok(Ok(out)) if out.stdout.len() > MAX_CAPTURE_BYTES => Err(BackendError::TooLarge(MAX_CAPTURE_BYTES)),
+        Ok(Ok(out)) if out.stdout.len() > MAX_CAPTURE_BYTES => {
+            Err(BackendError::TooLarge(MAX_CAPTURE_BYTES))
+        }
         Ok(Ok(out)) => Ok(out.stdout),
     }
 }
@@ -166,7 +173,10 @@ pub fn fingerprint(monitors: &[Monitor]) -> u64 {
         .filter(|m| !m.disabled)
         .map(|m| {
             let (w, h) = m.logical_size();
-            format!("{}:{},{},{}x{},s{},t{}", m.name, m.x, m.y, w, h, m.scale, m.transform)
+            format!(
+                "{}:{},{},{}x{},s{},t{}",
+                m.name, m.x, m.y, w, h, m.scale, m.transform
+            )
         })
         .collect();
     parts.sort();
@@ -183,7 +193,10 @@ pub fn selectable(monitors: Vec<Monitor>) -> Vec<Monitor> {
 /// Watches Hyprland's event socket; bumps `generation` on any display-relevant
 /// event and on every disconnect/reconnect (the socket has no replay cursor,
 /// so a gap means we may have missed a change-and-restore).
-pub fn watch_events(generation: Arc<AtomicU64>, healthy: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
+pub fn watch_events(
+    generation: Arc<AtomicU64>,
+    healthy: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             match event_socket_path() {
@@ -254,7 +267,12 @@ pub fn watch_wayland_outputs(
         ) {
             // Only post-initial-roundtrip events reach us; initial globals are
             // bound from GlobalList::contents() below.
-            if let wl_registry::Event::Global { name, interface, version } = event {
+            if let wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } = event
+            {
                 if interface == "wl_output" {
                     registry.bind::<wl_output::WlOutput, _, _>(name, version.min(4), qhandle, ());
                 }
@@ -277,45 +295,47 @@ pub fn watch_wayland_outputs(
         }
     }
 
-    std::thread::spawn(move || loop {
-        let Some(path) = wayland_socket_path() else {
-            std::thread::sleep(Duration::from_secs(1));
-            continue;
-        };
-        let run = || -> Result<(), Box<dyn std::error::Error>> {
-            let stream = std::os::unix::net::UnixStream::connect(path)?;
-            let backend = wayland_client::backend::Backend::connect(stream)?;
-            let conn = Connection::from_backend(backend);
-            let (globals, mut queue) =
-                wayland_client::globals::registry_queue_init::<Watcher>(&conn)?;
-            let mut watcher = Watcher {
-                generation: generation.clone(),
+    std::thread::spawn(move || {
+        loop {
+            let Some(path) = wayland_socket_path() else {
+                std::thread::sleep(Duration::from_secs(1));
+                continue;
             };
-            // Bind every currently advertised output; new ones are bound via
-            // the forwarded registry events above.
-            for global in globals.contents().clone_list() {
-                if global.interface == "wl_output" {
-                    globals.registry().bind::<wl_output::WlOutput, _, _>(
-                        global.name,
-                        global.version.min(4),
-                        &queue.handle(),
-                        (),
-                    );
+            let run = || -> Result<(), Box<dyn std::error::Error>> {
+                let stream = std::os::unix::net::UnixStream::connect(path)?;
+                let backend = wayland_client::backend::Backend::connect(stream)?;
+                let conn = Connection::from_backend(backend);
+                let (globals, mut queue) =
+                    wayland_client::globals::registry_queue_init::<Watcher>(&conn)?;
+                let mut watcher = Watcher {
+                    generation: generation.clone(),
+                };
+                // Bind every currently advertised output; new ones are bound via
+                // the forwarded registry events above.
+                for global in globals.contents().clone_list() {
+                    if global.interface == "wl_output" {
+                        globals.registry().bind::<wl_output::WlOutput, _, _>(
+                            global.name,
+                            global.version.min(4),
+                            &queue.handle(),
+                            (),
+                        );
+                    }
                 }
+                queue.roundtrip(&mut watcher)?;
+                healthy.store(true, Ordering::SeqCst);
+                loop {
+                    queue.blocking_dispatch(&mut watcher)?;
+                }
+            };
+            if let Err(e) = run() {
+                eprintln!("wayland output watcher disconnected: {e}");
             }
-            queue.roundtrip(&mut watcher)?;
-            healthy.store(true, Ordering::SeqCst);
-            loop {
-                queue.blocking_dispatch(&mut watcher)?;
-            }
-        };
-        if let Err(e) = run() {
-            eprintln!("wayland output watcher disconnected: {e}");
+            // Connection lost: we may have missed a change-and-restore.
+            healthy.store(false, Ordering::SeqCst);
+            generation.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_secs(1));
         }
-        // Connection lost: we may have missed a change-and-restore.
-        healthy.store(false, Ordering::SeqCst);
-        generation.fetch_add(1, Ordering::SeqCst);
-        std::thread::sleep(Duration::from_secs(1));
     })
 }
 
@@ -394,10 +414,21 @@ pub fn map_point(
 #[derive(Debug)]
 pub enum PointerOp {
     /// Absolute position + frame extents for this dispatch.
-    Move { x: u32, y: u32, x_extent: u32, y_extent: u32 },
-    Button { code: u32, pressed: bool },
+    Move {
+        x: u32,
+        y: u32,
+        x_extent: u32,
+        y_extent: u32,
+    },
+    Button {
+        code: u32,
+        pressed: bool,
+    },
     /// Signed wheel steps; axis 0 = vertical, 1 = horizontal.
-    Scroll { axis: u8, steps: i32 },
+    Scroll {
+        axis: u8,
+        steps: i32,
+    },
     Frame,
 }
 
@@ -421,7 +452,8 @@ impl Pointer {
     /// request and is retried after failures; the pointer object persists so
     /// button state survives across calls (required for drags later).
     pub fn start() -> Self {
-        let (tx, rx) = std::sync::mpsc::channel::<(Vec<PointerOp>, std::sync::mpsc::Sender<Delivery>)>();
+        let (tx, rx) =
+            std::sync::mpsc::channel::<(Vec<PointerOp>, std::sync::mpsc::Sender<Delivery>)>();
         std::thread::spawn(move || {
             let mut session: Option<pointer_session::Session> = None;
             for (ops, reply) in rx {
@@ -447,18 +479,20 @@ impl Pointer {
         if self.tx.send((ops, reply)).is_err() {
             return Delivery::None;
         }
-        rx.recv().unwrap_or(Delivery::None)
+        // Bound the wait: a wedged compositor must not hang every later action.
+        rx.recv_timeout(Duration::from_secs(10))
+            .unwrap_or(Delivery::Unknown)
     }
 }
 
 mod pointer_session {
     use super::{Delivery, PointerOp};
-        use wayland_client::globals::{GlobalListContents, registry_queue_init};
+    use wayland_client::globals::{GlobalListContents, registry_queue_init};
     use wayland_client::protocol::{wl_output, wl_pointer, wl_registry};
     use wayland_client::{Connection, Dispatch, QueueHandle};
     use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1;
     use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1;
-    
+
     pub struct Session {
         conn: Connection,
         pointer: ZwlrVirtualPointerV1,
@@ -526,17 +560,22 @@ mod pointer_session {
             let mut manager = None;
             for g in globals.contents().clone_list() {
                 if g.interface == "zwlr_virtual_pointer_manager_v1" {
-                    manager = Some(globals.registry().bind::<ZwlrVirtualPointerManagerV1, _, _>(
-                        g.name,
-                        g.version.min(2),
-                        &queue.handle(),
-                        (),
-                    ));
+                    manager = Some(
+                        globals
+                            .registry()
+                            .bind::<ZwlrVirtualPointerManagerV1, _, _>(
+                                g.name,
+                                g.version.min(2),
+                                &queue.handle(),
+                                (),
+                            ),
+                    );
                 }
             }
             let manager = manager.ok_or("zwlr_virtual_pointer_manager_v1 not advertised")?;
             // v2: no seat/output mapping -> pointer covers the whole layout.
-            let pointer = manager.create_virtual_pointer_with_output(None, None, &queue.handle(), ());
+            let pointer =
+                manager.create_virtual_pointer_with_output(None, None, &queue.handle(), ());
             queue.roundtrip(&mut state)?;
             Ok(Self {
                 conn,
@@ -556,7 +595,8 @@ mod pointer_session {
         fn release_all(&mut self) {
             for code in self.held.drain().collect::<Vec<_>>() {
                 let t = self.tick();
-                self.pointer.button(t, code, wl_pointer::ButtonState::Released);
+                self.pointer
+                    .button(t, code, wl_pointer::ButtonState::Released);
             }
             self.pointer.frame();
             let _ = self.conn.flush();
@@ -567,7 +607,12 @@ mod pointer_session {
             for op in ops {
                 let t = self.tick();
                 match *op {
-                    PointerOp::Move { x, y, x_extent, y_extent } => {
+                    PointerOp::Move {
+                        x,
+                        y,
+                        x_extent,
+                        y_extent,
+                    } => {
                         self.pointer.motion_absolute(t, x, y, x_extent, y_extent);
                     }
                     PointerOp::Button { code, pressed } => {
@@ -591,7 +636,12 @@ mod pointer_session {
                             1 => wl_pointer::Axis::HorizontalScroll,
                             _ => wl_pointer::Axis::VerticalScroll,
                         };
-                        self.pointer.axis_discrete(t, axis_e, steps as f64 * 120.0, steps);
+                        // Wheel semantics: discrete steps are authoritative;
+                        // the smooth axis carries the equivalent 120/step
+                        // value. Clients honoring both pick discrete.
+                        self.pointer.axis_source(wl_pointer::AxisSource::Wheel);
+                        self.pointer
+                            .axis_discrete(t, axis_e, steps as f64 * 120.0, steps);
                         self.pointer.axis(t, axis_e, steps as f64 * 120.0);
                     }
                     PointerOp::Frame => self.pointer.frame(),
@@ -599,8 +649,16 @@ mod pointer_session {
                 sent = true;
             }
             if self.conn.flush().is_err() {
+                // Best-effort release of held buttons before dropping the
+                // pointer; a held button without release can damage
+                // compositor pointer state.
+                self.release_all();
                 self.broken = true;
-                return if sent { Delivery::Partial } else { Delivery::None };
+                return if sent {
+                    Delivery::Partial
+                } else {
+                    Delivery::None
+                };
             }
             // Sync the connection: surfaces transport errors (e.g. protocol
             // error, disconnect) instead of assuming the queue was accepted.
@@ -649,17 +707,29 @@ mod tests {
 
     #[test]
     fn logical_size_normal_and_fractional() {
-        assert_eq!(mon("a", 0, 0, 2560, 1440, 1.25, 0).logical_size(), (2048, 1152));
-        assert_eq!(mon("a", 0, 0, 3840, 2160, 2.0, 0).logical_size(), (1920, 1080));
+        assert_eq!(
+            mon("a", 0, 0, 2560, 1440, 1.25, 0).logical_size(),
+            (2048, 1152)
+        );
+        assert_eq!(
+            mon("a", 0, 0, 3840, 2160, 2.0, 0).logical_size(),
+            (1920, 1080)
+        );
     }
 
     #[test]
     fn logical_size_swaps_axes_for_90_270_transforms() {
         for t in [1u8, 3, 5, 7] {
-            assert_eq!(mon("a", 0, 0, 2560, 1440, 1.0, t).logical_size(), (1440, 2560));
+            assert_eq!(
+                mon("a", 0, 0, 2560, 1440, 1.0, t).logical_size(),
+                (1440, 2560)
+            );
         }
         for t in [0u8, 2, 4, 6] {
-            assert_eq!(mon("a", 0, 0, 2560, 1440, 1.0, t).logical_size(), (2560, 1440));
+            assert_eq!(
+                mon("a", 0, 0, 2560, 1440, 1.0, t).logical_size(),
+                (2560, 1440)
+            );
         }
     }
 
@@ -669,10 +739,10 @@ mod tests {
         let same = vec![mon("eDP-1", 0, 0, 2560, 1440, 1.25, 0)];
         assert_eq!(fingerprint(&base), fingerprint(&same));
         for altered in [
-            vec![mon("eDP-1", 0, 0, 2560, 1440, 1.5, 0)],   // scale
+            vec![mon("eDP-1", 0, 0, 2560, 1440, 1.5, 0)], // scale
             vec![mon("eDP-1", -2048, 0, 2560, 1440, 1.25, 0)], // position
             vec![mon("eDP-1", 0, 0, 2560, 1440, 1.25, 1)], // transform
-            vec![mon("DP-1", 0, 0, 2560, 1440, 1.25, 0)],  // identity
+            vec![mon("DP-1", 0, 0, 2560, 1440, 1.25, 0)], // identity
         ] {
             assert_ne!(fingerprint(&base), fingerprint(&altered));
         }
@@ -692,7 +762,10 @@ mod tests {
         let b = layout(&[m.clone()]);
         assert_eq!(map_point(0.0, 0.0, 2560, 1440, &m, &b), Some((0, 0)));
         // Center of the image -> center of the logical box.
-        assert_eq!(map_point(1280.0, 720.0, 2560, 1440, &m, &b), Some((1024, 576)));
+        assert_eq!(
+            map_point(1280.0, 720.0, 2560, 1440, &m, &b),
+            Some((1024, 576))
+        );
         // Last valid pixel stays inside.
         let (x, y) = map_point(2559.0, 1439.0, 2560, 1440, &m, &b).unwrap();
         assert!(x < b.x_extent && y < b.y_extent);
@@ -705,11 +778,20 @@ mod tests {
         let left = mon("DP-1", -1920, 0, 1920, 1080, 1.0, 0);
         let right = mon("eDP-1", 0, 0, 3840, 2160, 2.0, 0); // logical 1920x1080
         let b = layout(&[left.clone(), right.clone()]);
-        assert_eq!((b.min_x, b.min_y, b.x_extent, b.y_extent), (-1920, 0, 3840, 1080));
+        assert_eq!(
+            (b.min_x, b.min_y, b.x_extent, b.y_extent),
+            (-1920, 0, 3840, 1080)
+        );
         // Center of left monitor's image -> (-960, 540) global -> (960, 540) abs.
-        assert_eq!(map_point(960.0, 540.0, 1920, 1080, &left, &b), Some((960, 540)));
+        assert_eq!(
+            map_point(960.0, 540.0, 1920, 1080, &left, &b),
+            Some((960, 540))
+        );
         // Center of right monitor's image -> (960, 540) global -> (2880, 540).
-        assert_eq!(map_point(1920.0, 1080.0, 3840, 2160, &right, &b), Some((2880, 540)));
+        assert_eq!(
+            map_point(1920.0, 1080.0, 3840, 2160, &right, &b),
+            Some((2880, 540))
+        );
     }
 
     #[test]
@@ -719,7 +801,10 @@ mod tests {
         let b = layout(&[m.clone()]);
         assert_eq!((b.x_extent, b.y_extent), (1440, 2560));
         // Image is already upright; bottom-right image pixel -> bottom-right of box.
-        assert_eq!(map_point(1439.0, 2559.0, 1440, 2560, &m, &b), Some((1439, 2559)));
+        assert_eq!(
+            map_point(1439.0, 2559.0, 1440, 2560, &m, &b),
+            Some((1439, 2559))
+        );
     }
 
     #[test]
@@ -727,8 +812,12 @@ mod tests {
         let m = mon("eDP-1", 0, 0, 2560, 1440, 1.25, 0);
         let b = layout(&[m.clone()]);
         for (px, py) in [
-            (2560.0, 0.0), (-1.0, 0.0), (0.0, 1440.0),
-            (f64::NAN, 0.0), (f64::INFINITY, 0.0), (0.0, f64::NEG_INFINITY),
+            (2560.0, 0.0),
+            (-1.0, 0.0),
+            (0.0, 1440.0),
+            (f64::NAN, 0.0),
+            (f64::INFINITY, 0.0),
+            (0.0, f64::NEG_INFINITY),
         ] {
             assert_eq!(map_point(px, py, 2560, 1440, &m, &b), None);
         }

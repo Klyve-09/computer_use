@@ -29,9 +29,22 @@ pub enum ClickButton {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ActionKind {
     /// Click at image-pixel coordinates from the referenced observation.
-    Click { x: f64, y: f64, button: ClickButton, #[serde(default)] double: bool },
+    Click {
+        x: f64,
+        y: f64,
+        button: ClickButton,
+        #[serde(default)]
+        double: bool,
+    },
     /// Scroll at a point: signed wheel steps, dy vertical, dx horizontal.
-    Scroll { x: f64, y: f64, #[serde(default)] dx: i32, #[serde(default)] dy: i32 },
+    Scroll {
+        x: f64,
+        y: f64,
+        #[serde(default)]
+        dx: i32,
+        #[serde(default)]
+        dy: i32,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -70,7 +83,12 @@ impl State {
     }
 
     fn revision(&self, fingerprint: u64) -> String {
-        format!("{}-{}-{:016x}", self.epoch, self.generation.load(Ordering::SeqCst), fingerprint)
+        format!(
+            "{}-{}-{:016x}",
+            self.epoch,
+            self.generation.load(Ordering::SeqCst),
+            fingerprint
+        )
     }
 
     /// Used by `computer_action` (issue #3); tested now because stale-
@@ -86,8 +104,12 @@ impl State {
         current_fingerprint: u64,
     ) -> Result<Observation, &'static str> {
         let observations = self.observations.lock().unwrap();
-        let obs = observations.get(id).ok_or("unknown or expired observation")?;
-        if obs.generation != self.generation.load(Ordering::SeqCst) || obs.fingerprint != current_fingerprint {
+        let obs = observations
+            .get(id)
+            .ok_or("unknown or expired observation")?;
+        if obs.generation != self.generation.load(Ordering::SeqCst)
+            || obs.fingerprint != current_fingerprint
+        {
             return Err("stale observation: display configuration changed");
         }
         Ok(obs.clone())
@@ -167,10 +189,16 @@ impl ComputerUse {
     }
 }
 
-fn ok_result(value: serde_json::Value, image_png: Option<Vec<u8>>) -> Result<CallToolResult, McpError> {
+fn ok_result(
+    value: serde_json::Value,
+    image_png: Option<Vec<u8>>,
+) -> Result<CallToolResult, McpError> {
     let mut content = vec![Content::text(value.to_string())];
     if let Some(png) = image_png {
-        content.push(Content::image(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, png), "image/png"));
+        content.push(Content::image(
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, png),
+            "image/png",
+        ));
     }
     let mut result = CallToolResult::success(content);
     result.structured_content = Some(value);
@@ -179,6 +207,18 @@ fn ok_result(value: serde_json::Value, image_png: Option<Vec<u8>>) -> Result<Cal
 
 fn err_result(code: &str, message: impl Into<String>) -> Result<CallToolResult, McpError> {
     let value = serde_json::json!({ "error": { "code": code, "message": message.into() } });
+    let mut result = CallToolResult::error(vec![Content::text(value.to_string())]);
+    result.structured_content = Some(value);
+    Ok(result)
+}
+
+/// Rejection on the action path: no input was sent, so effect is `none`.
+fn action_err(code: &str, message: impl Into<String>) -> Result<CallToolResult, McpError> {
+    let value = serde_json::json!({
+        "outcome": "rejected",
+        "effect": "none",
+        "error": { "code": code, "message": message.into() },
+    });
     let mut result = CallToolResult::error(vec![Content::text(value.to_string())]);
     result.structured_content = Some(value);
     Ok(result)
@@ -221,7 +261,10 @@ impl ComputerUse {
     /// Observation ID, the actual image dimensions, and the Display
     /// Configuration revision the image belongs to. Read-only.
     #[tool(name = "computer_observe")]
-    async fn computer_observe(&self, Parameters(p): Parameters<ObserveParams>) -> Result<CallToolResult, McpError> {
+    async fn computer_observe(
+        &self,
+        Parameters(p): Parameters<ObserveParams>,
+    ) -> Result<CallToolResult, McpError> {
         // Capture bracketed by configuration checks; retry once if the display
         // configuration races the capture, then refuse rather than issue an
         // observation whose coordinate space may already be wrong.
@@ -233,7 +276,10 @@ impl ComputerUse {
             let Some(monitor) = pre.iter().find(|m| m.name == p.monitor) else {
                 return err_result(
                     "MONITOR_NOT_FOUND",
-                    format!("no selectable monitor {:?}; call computer_monitors", p.monitor),
+                    format!(
+                        "no selectable monitor {:?}; call computer_monitors",
+                        p.monitor
+                    ),
                 );
             };
             let gen_pre = self.state.generation.load(Ordering::SeqCst);
@@ -270,7 +316,10 @@ impl ComputerUse {
     /// failed post-action capture, do NOT repeat the action — call
     /// computer_observe and assess first.
     #[tool(name = "computer_action")]
-    async fn computer_action(&self, Parameters(p): Parameters<ActionParams>) -> Result<CallToolResult, McpError> {
+    async fn computer_action(
+        &self,
+        Parameters(p): Parameters<ActionParams>,
+    ) -> Result<CallToolResult, McpError> {
         let _serial = self.action_lock.lock().await;
 
         let snapshot = match backend::monitors().await.map(backend::selectable) {
@@ -281,37 +330,46 @@ impl ComputerUse {
         let obs = match self.state.validate_observation(&p.observation_id, fp) {
             Ok(o) => o,
             Err(msg) => {
-                return err_result(
+                return action_err(
                     "STALE_OBSERVATION",
                     format!("{msg}; call computer_observe for a fresh observation_id"),
-                )
+                );
             }
         };
         if !self.state.actionable() {
-            return err_result(
+            return action_err(
                 "EVENT_CHANNEL_UNHEALTHY",
                 "display-change notification channel is down; mutation paused until it recovers",
             );
         }
         let Some(monitor) = snapshot.iter().find(|m| m.name == obs.monitor) else {
-            return err_result("MONITOR_NOT_FOUND", "observation's monitor is gone");
+            return action_err("MONITOR_NOT_FOUND", "observation's monitor is gone");
         };
         let Some(layout) = backend::layout_box(&snapshot) else {
-            return err_result("NO_LAYOUT", "no selectable monitors");
+            return action_err("NO_LAYOUT", "no selectable monitors");
         };
         let (px, py) = match &p.action {
             ActionKind::Click { x, y, .. } | ActionKind::Scroll { x, y, .. } => (*x, *y),
         };
-        let Some((ax, ay)) = backend::map_point(px, py, obs.image_width, obs.image_height, monitor, &layout)
+        let Some((ax, ay)) =
+            backend::map_point(px, py, obs.image_width, obs.image_height, monitor, &layout)
         else {
-            return err_result(
+            return action_err(
                 "INVALID_COORDINATES",
-                format!("point ({px}, {py}) is outside the {0}x{1} image", obs.image_width, obs.image_height),
+                format!(
+                    "point ({px}, {py}) is outside the {0}x{1} image",
+                    obs.image_width, obs.image_height
+                ),
             );
         };
 
         let mut ops = vec![
-            PointerOp::Move { x: ax, y: ay, x_extent: layout.x_extent, y_extent: layout.y_extent },
+            PointerOp::Move {
+                x: ax,
+                y: ay,
+                x_extent: layout.x_extent,
+                y_extent: layout.y_extent,
+            },
             PointerOp::Frame,
         ];
         match &p.action {
@@ -322,17 +380,32 @@ impl ComputerUse {
                 };
                 let presses = if *double { 2 } else { 1 };
                 for _ in 0..presses {
-                    ops.push(PointerOp::Button { code, pressed: true });
-                    ops.push(PointerOp::Button { code, pressed: false });
+                    ops.push(PointerOp::Button {
+                        code,
+                        pressed: true,
+                    });
+                    ops.push(PointerOp::Button {
+                        code,
+                        pressed: false,
+                    });
                 }
                 ops.push(PointerOp::Frame);
             }
             ActionKind::Scroll { dx, dy, .. } => {
+                if *dx == 0 && *dy == 0 {
+                    return action_err("INVALID_SCROLL", "dx and dy are both 0; nothing to scroll");
+                }
                 if *dy != 0 {
-                    ops.push(PointerOp::Scroll { axis: 0, steps: *dy });
+                    ops.push(PointerOp::Scroll {
+                        axis: 0,
+                        steps: *dy,
+                    });
                 }
                 if *dx != 0 {
-                    ops.push(PointerOp::Scroll { axis: 1, steps: *dx });
+                    ops.push(PointerOp::Scroll {
+                        axis: 1,
+                        steps: *dx,
+                    });
                 }
                 ops.push(PointerOp::Frame);
             }
@@ -365,7 +438,7 @@ impl ComputerUse {
         let action_json = serde_json::to_value(&p.action).unwrap_or_default();
 
         if delivery == backend::Delivery::None {
-            return err_result(
+            return action_err(
                 "POINTER_UNAVAILABLE",
                 "virtual pointer backend unavailable; no input was sent",
             );
@@ -397,7 +470,10 @@ impl ComputerUse {
             match post_obs {
                 Some((m, png, w, h)) => {
                     let generation = self.state.generation.load(Ordering::SeqCst);
-                    let fp_now = post.as_ref().map(|ms| backend::fingerprint(ms)).unwrap_or(fp);
+                    let fp_now = post
+                        .as_ref()
+                        .map(|ms| backend::fingerprint(ms))
+                        .unwrap_or(fp);
                     v["observation"] = self.record_observation(&m, w, h, generation, fp_now);
                     return partial_result(v, Some(png));
                 }
@@ -411,7 +487,10 @@ impl ComputerUse {
         match post_obs {
             Some((m, png, w, h)) => {
                 let generation = self.state.generation.load(Ordering::SeqCst);
-                let fp_now = post.as_ref().map(|ms| backend::fingerprint(ms)).unwrap_or(fp);
+                let fp_now = post
+                    .as_ref()
+                    .map(|ms| backend::fingerprint(ms))
+                    .unwrap_or(fp);
                 let mut v = serde_json::json!({
                     "outcome": "ok",
                     "effect": "completed",
@@ -436,7 +515,10 @@ impl ComputerUse {
 
 /// Result with possible input side effects: isError + a prominent no-replay
 /// warning text block, then the compact JSON and optional image.
-fn partial_result(value: serde_json::Value, image_png: Option<Vec<u8>>) -> Result<CallToolResult, McpError> {
+fn partial_result(
+    value: serde_json::Value,
+    image_png: Option<Vec<u8>>,
+) -> Result<CallToolResult, McpError> {
     let mut content = vec![Content::text(
         "WARNING: input may already have been delivered. Do NOT repeat this action; call computer_observe and assess the screen first.",
     )];
@@ -456,7 +538,9 @@ fn partial_result(value: serde_json::Value, image_png: Option<Vec<u8>>) -> Resul
 impl ServerHandler for ComputerUse {
     fn get_info(&self) -> rmcp::model::ServerConfig {
         let mut info = rmcp::model::ServerConfig::new(
-            rmcp::model::ServerCapabilities::builder().enable_tools().build(),
+            rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .build(),
         );
         info.server_info.name = "computer-use-mcp".into();
         info.server_info.version = env!("CARGO_PKG_VERSION").into();
@@ -472,7 +556,9 @@ impl ServerHandler for ComputerUse {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none() && std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+    if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none()
+        && std::env::var_os("XDG_RUNTIME_DIR").is_none()
+    {
         eprintln!("warning: no Hyprland session environment; tools will report MISSING_DEPENDENCY");
     }
     let service = ComputerUse::new().serve(rmcp::transport::stdio()).await?;

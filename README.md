@@ -7,9 +7,10 @@ Approved specification: GitHub issue
 
 ## Status
 
-Implemented (issue #2): `computer_monitors` and `computer_observe` —
-read-only monitor discovery and per-monitor PNG capture. Input actions
-(`computer_action`) arrive in issues #3–#5; recovery hardening in #6.
+Implemented (issues #2–#3): `computer_monitors`, `computer_observe`, and
+`computer_action` (left/right click, double-click, signed horizontal/vertical
+scroll). Keyboard/text actions and drag arrive in issues #4–#5; recovery
+hardening in #6.
 
 ## Requirements
 
@@ -44,6 +45,7 @@ One command; no env flags needed because of the session discovery above.
 |---|---|
 | `computer_monitors` | Lists selectable monitors: id (Hyprland output name), description, oriented logical bounds, scale, transform, plus an opaque `revision` and `events_healthy`. |
 | `computer_observe` | `{"monitor": "<id>"}` → PNG image block, `observation_id`, actual image dimensions, monitor summary, `revision`, `actionable`. |
+| `computer_action` | `{"observation_id": "<id>", "action": {"kind": "click"|"scroll", ...}}` → performs one input action at image-pixel coordinates and returns a fresh observation of the same monitor. `effect` reports `none`/`completed`/`partial`/`unknown`; on partial/unknown or post-action capture failure the result says not to replay. |
 
 Observations are bound to a session epoch + event-driven generation + a
 geometry fingerprint. Two notification channels advance the generation:
@@ -74,6 +76,10 @@ observation of a monitor supersedes earlier IDs for that monitor.
   generation unconditionally.
 - `wl_output` reports integer scale factors only; it is used purely as an
   invalidation signal, never for coordinate math.
+- Pointer input uses one persistent output-unmapped
+  `zwlr_virtual_pointer_v1` mapped onto the bounding box of the whole logical
+  layout; scroll uses wheel `axis_discrete` + `axis` (120/step). Input is
+  serialized and bounded (10 s pointer wait, 150 ms post-action settle).
 
 ## Verification
 
