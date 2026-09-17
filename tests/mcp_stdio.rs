@@ -589,9 +589,14 @@ fn wedged_input_connection_times_out_and_recovers() {
     let rig = event_rig();
     let sock = rig.dir.join("input.sock");
     let silent = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    // The accept channel proves the worker reached the wedged-roundtrip
+    // stage, so the assertions below cannot pass on an unrelated setup
+    // failure before the intended timeout/cancellation path.
+    let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut held = Vec::new(); // keep peers alive so connects stay wedged
         while let Ok((peer, _)) = silent.accept() {
+            let _ = accepted_tx.send(());
             held.push(peer);
         }
     });
@@ -616,19 +621,19 @@ fn wedged_input_connection_times_out_and_recovers() {
         "computer_action",
         json!({"observation_id": oid, "action": {"kind": "click", "x": 10, "y": 10, "button": "left"}}),
     );
-    // The worker's wedged connect is interrupted by timeout + socket
-    // shutdown; the reply must arrive, not hang. Allow generous headroom.
+    // The worker's wedged roundtrip is interrupted by the reply timeout +
+    // socket shutdown; the reply must arrive, not hang. Generous headroom.
     assert!(start.elapsed() < std::time::Duration::from_secs(20), "{r}");
     let sc = &r["result"]["structuredContent"];
     assert_eq!(r["result"]["isError"], json!(true), "{r}");
-    // Wedged before any event: either the reply-timeout cancel aborted it
-    // (CANCELLED) or the backend never came up (INPUT_BACKEND_UNAVAILABLE).
-    let code = sc["error"]["code"].as_str().unwrap_or("");
-    assert!(
-        code == "CANCELLED" || code == "INPUT_BACKEND_UNAVAILABLE",
-        "{r}"
-    );
+    // The socket accepted the connection, so the worker wedged in the
+    // Wayland roundtrip and the reply-timeout cancel is the only path that
+    // frees it: CANCELLED, never an unrelated backend setup failure.
+    assert_eq!(sc["error"]["code"], "CANCELLED", "{r}");
     assert_eq!(sc["effect"], "none", "{r}");
+    accepted_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("input session never connected to the silent socket");
 
     // The server is still responsive afterwards: the action lock was held
     // through teardown, so no delayed input can overlap later requests.
@@ -681,8 +686,8 @@ fn cancelled_queued_action_runs_no_side_effects() {
         .unwrap()
         .to_string();
 
-    // Action A wedges mid-roundtrip and holds the serialized action lock.
-    let a = c.send_tool(
+    // The wedged action holds the serialized action lock mid-roundtrip.
+    let wedged = c.send_tool(
         "computer_action",
         json!({"observation_id": oid, "action": {"kind": "click", "x": 10, "y": 10, "button": "left"}}),
     );
@@ -690,19 +695,19 @@ fn cancelled_queued_action_runs_no_side_effects() {
         .recv_timeout(std::time::Duration::from_secs(5))
         .expect("input session never connected");
 
-    // Action B queues behind it, then is cancelled before it can run.
-    let b = c.send_tool(
+    // The queued action waits behind it, then is cancelled before it can run.
+    let queued = c.send_tool(
         "computer_action",
         json!({"observation_id": oid, "action": {"kind": "type_text", "text": "CANCELLED_REQUEST_EXECUTED"}}),
     );
     std::thread::sleep(std::time::Duration::from_millis(150));
-    c.cancel(b);
+    c.cancel(queued);
     std::thread::sleep(std::time::Duration::from_millis(50));
-    c.cancel(a);
+    c.cancel(wedged);
 
-    // rmcp drops the response for a cancelled request, so neither A nor B
-    // produces one. A follow-up request proves the cancelled wedged action
-    // released the action lock instead of hanging the worker.
+    // rmcp drops the response for a cancelled request, so neither produces
+    // one. A follow-up request proves the cancelled wedged action released
+    // the action lock instead of hanging the worker.
     let done = c.call_tool(
         "computer_action",
         json!({"observation_id": "invalid", "action": {"kind": "click", "x": 10, "y": 10, "button": "left"}}),
@@ -711,8 +716,9 @@ fn cancelled_queued_action_runs_no_side_effects() {
         done["result"]["structuredContent"]["error"]["code"], "STALE_OBSERVATION",
         "{done}"
     );
-    // The regression assertion: once A was interrupted and B's queued slot
-    // ran, the cancelled request must have produced no side effect.
+    // The regression assertion: once the wedged action was interrupted and
+    // the queued slot ran, the cancelled request must have produced no
+    // side effect.
     assert!(
         !rig.dir.join("clipboard-marker").exists(),
         "cancelled queued request replaced the clipboard"
@@ -781,5 +787,151 @@ fn full_input_backlog_connect_is_deadline_bound() {
     assert_eq!(
         bad["result"]["structuredContent"]["error"]["code"], "STALE_OBSERVATION",
         "{bad}"
+    );
+}
+
+/// A wl-copy that reads the text then delays its side effect past the
+/// clipboard deadline must be killed before the server returns: its late
+/// marker can never appear after the action has reported (review P1).
+/// Controlled child; the real clipboard is untouched.
+#[test]
+fn clipboard_timeout_kills_delayed_side_effect_child() {
+    let rig = event_rig();
+    let (mon, mon_id) = first_monitor();
+    focus_fixture(&rig, mon_id);
+    // Reads all of stdin (so the write completes), then sleeps 7s and
+    // writes a marker — a side effect landing after the 5s deadline.
+    script(
+        &rig,
+        "wl-copy",
+        &format!(
+            "#!/usr/bin/python3\nimport pathlib,sys,time\nsys.stdin.buffer.read()\ntime.sleep(7)\npathlib.Path(\"{d}/late-clipboard-marker\").write_text(\"late\")\n",
+            d = rig.dir.display()
+        ),
+    );
+    let Some(mut c) = Client::start_with(&rig_env(&rig)) else {
+        return;
+    };
+    init(&mut c);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let obs = c.call_tool("computer_observe", json!({"monitor": mon}));
+    let oid = obs["result"]["structuredContent"]["observation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let start = std::time::Instant::now();
+    let r = c.call_tool(
+        "computer_action",
+        json!({"observation_id": oid, "action": {"kind": "type_text", "text": "late clipboard"}}),
+    );
+    // One deadline bounds the whole write+wait (~5s), not the child's own
+    // schedule.
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(9),
+        "clipboard write+wait escaped its deadline: {r}"
+    );
+    let sc = &r["result"]["structuredContent"];
+    assert_eq!(r["result"]["isError"], json!(true), "{r}");
+    // wl-copy ran and may have replaced the clipboard: honest `unknown`,
+    // never `none`.
+    assert_eq!(sc["effect"], "unknown", "{r}");
+    assert_eq!(sc["do_not_replay"], json!(true), "{r}");
+
+    // The child was killed and reaped: wait past its 7s marker schedule
+    // and confirm the delayed side effect never lands.
+    let remaining = std::time::Duration::from_secs(8).saturating_sub(start.elapsed());
+    std::thread::sleep(remaining);
+    assert!(
+        !rig.dir.join("late-clipboard-marker").exists(),
+        "killed wl-copy performed a clipboard side effect after return"
+    );
+}
+
+/// A wl-copy that never reads stdin must not hold the request or the
+/// serialized action lock past the clipboard deadline, and a mid-write
+/// cancellation must release the action path too (review P1). Controlled
+/// child; the real clipboard is untouched.
+#[test]
+fn clipboard_blocked_stdin_is_bounded_and_cancellable() {
+    let rig = event_rig();
+    let (mon, mon_id) = first_monitor();
+    focus_fixture(&rig, mon_id);
+    // Never reads stdin: a payload larger than the 64KiB pipe buffer
+    // blocks write_all indefinitely without the fix.
+    script(
+        &rig,
+        "wl-copy",
+        "#!/usr/bin/python3\nimport time\ntime.sleep(30)\n",
+    );
+    let Some(mut c) = Client::start_with(&rig_env(&rig)) else {
+        return;
+    };
+    init(&mut c);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let big = "x".repeat(262144);
+
+    // Phase 1: the deadline bounds the blocked write itself.
+    let obs = c.call_tool("computer_observe", json!({"monitor": mon}));
+    let oid = obs["result"]["structuredContent"]["observation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let start = std::time::Instant::now();
+    let r = c.call_tool(
+        "computer_action",
+        json!({"observation_id": oid, "action": {"kind": "type_text", "text": big}}),
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(9),
+        "blocked stdin write escaped its deadline: {r}"
+    );
+    let sc = &r["result"]["structuredContent"];
+    assert_eq!(r["result"]["isError"], json!(true), "{r}");
+    assert_eq!(sc["effect"], "unknown", "{r}");
+    // The timed-out child was killed and reaped, so the lock is free.
+    let start = std::time::Instant::now();
+    let done = c.call_tool(
+        "computer_action",
+        json!({"observation_id": "invalid", "action": {"kind": "click", "x": 10, "y": 10, "button": "left"}}),
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "following action stuck behind the timed-out clipboard child: {done}"
+    );
+    assert_eq!(
+        done["result"]["structuredContent"]["error"]["code"], "STALE_OBSERVATION",
+        "{done}"
+    );
+
+    // Phase 2: a request cancelled while its stdin write is blocked must
+    // also release the action path promptly.
+    let obs = c.call_tool("computer_observe", json!({"monitor": mon}));
+    let oid = obs["result"]["structuredContent"]["observation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let wedged = c.send_tool(
+        "computer_action",
+        json!({"observation_id": oid, "action": {"kind": "type_text", "text": big}}),
+    );
+    // Let the action reach the blocked write, then cancel it.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    c.cancel(wedged);
+    // rmcp drops the cancelled request's response; a follow-up request
+    // proves the cancel killed the child and released the action lock
+    // well before the 5s deadline.
+    let start = std::time::Instant::now();
+    let done = c.call_tool(
+        "computer_action",
+        json!({"observation_id": "invalid", "action": {"kind": "click", "x": 10, "y": 10, "button": "left"}}),
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(4),
+        "following action stuck behind a cancelled blocked clipboard write: {done}"
+    );
+    assert_eq!(
+        done["result"]["structuredContent"]["error"]["code"], "STALE_OBSERVATION",
+        "{done}"
     );
 }

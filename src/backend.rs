@@ -160,8 +160,12 @@ pub async fn focused_monitor() -> Result<Option<String>, BackendError> {
 
 /// Replace the clipboard with the exact UTF-8 text (stdin, never shell).
 /// Cancellation is checked before spawn (returns `Cancelled`, no side
-/// effect) and raced against the subprocess: a mid-run cancel kills wl-copy
-/// and reports `Failed`, since the clipboard may already be replaced.
+/// effect). The complete write-and-wait runs under one deadline raced
+/// against the abort signal: a child that never reads stdin or exits late
+/// cannot hold the action lock, and on timeout/cancel wl-copy is killed
+/// and reaped before returning so it cannot change the clipboard after
+/// the action has already reported. Any post-spawn failure is a possible
+/// side effect (`unknown` upstream).
 pub async fn clipboard_set(text: &str, abort: &Abort) -> Result<(), BackendError> {
     if abort.stopped() {
         return Err(BackendError::Cancelled);
@@ -182,27 +186,44 @@ pub async fn clipboard_set(text: &str, abort: &Abort) -> Result<(), BackendError
                 }
             })?;
     use tokio::io::AsyncWriteExt;
-    let mut stdin = child.stdin.take().unwrap();
+    let stdin = child.stdin.take().unwrap();
+    // `write` owns the stdin handle: ChildStdin::shutdown does not close
+    // the pipe, so only completing or dropping this future delivers EOF.
     let write = async move {
+        let mut stdin = stdin;
         stdin.write_all(text.as_bytes()).await?;
         stdin.shutdown().await
     };
-    let (write_result, child_result) = tokio::join!(write, async {
-        tokio::select! {
-            r = tokio::time::timeout(HYPRCTL_TIMEOUT, child.wait()) => Some(r),
-            _ = abort.wait_cancelled() => {
-                let _ = child.kill().await;
-                None
-            }
+    // One bounded operation: feed the payload, close stdin, wait for exit.
+    // A child that never reads blocks the write arm inside the same
+    // deadline instead of escaping it.
+    let op = async { tokio::join!(write, child.wait()) };
+    enum Stop {
+        Timeout,
+        Cancelled,
+    }
+    let outcome = tokio::select! {
+        r = op => Ok(r),
+        _ = tokio::time::sleep(HYPRCTL_TIMEOUT) => Err(Stop::Timeout),
+        _ = abort.wait_cancelled() => Err(Stop::Cancelled),
+    };
+    let (write_result, status) = match outcome {
+        Ok(r) => r,
+        Err(stop) => {
+            // Dropping `op` closed stdin; kill AND reap the child so no
+            // wl-copy outlives the action lock for a late side effect.
+            let _ = child.kill().await;
+            return Err(match stop {
+                Stop::Timeout => BackendError::Timeout("wl-copy"),
+                Stop::Cancelled => BackendError::Failed("wl-copy cancelled".into()),
+            });
         }
-    });
+    };
     write_result.map_err(|e| BackendError::Failed(format!("wl-copy stdin: {e}")))?;
-    match child_result {
-        None => Err(BackendError::Failed("wl-copy cancelled".into())),
-        Some(Err(_)) => Err(BackendError::Timeout("wl-copy")),
-        Some(Ok(Err(e))) => Err(BackendError::Failed(format!("wl-copy: {e}"))),
-        Some(Ok(Ok(s))) if !s.success() => Err(BackendError::Failed(format!("wl-copy exited {s}"))),
-        Some(Ok(Ok(_))) => Ok(()),
+    match status {
+        Err(e) => Err(BackendError::Failed(format!("wl-copy: {e}"))),
+        Ok(s) if !s.success() => Err(BackendError::Failed(format!("wl-copy exited {s}"))),
+        Ok(_) => Ok(()),
     }
 }
 
