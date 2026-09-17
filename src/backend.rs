@@ -713,9 +713,13 @@ mod pointer_session {
                     }
                     PointerOp::Wait { ms } => {
                         // Flush before sleeping so earlier events are already
-                        // on the wire; caps keep one action bounded.
+                        // on the wire; caps keep one action bounded. Advance
+                        // the event clock by the slept time so toolkits see
+                        // real gesture timing, not a jump.
                         let _ = self.conn.flush();
-                        std::thread::sleep(std::time::Duration::from_millis(ms.min(2000) as u64));
+                        let ms = ms.min(2000);
+                        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+                        self.time_ms = self.time_ms.wrapping_add(ms);
                     }
                     PointerOp::Frame => self.pointer.frame(),
                 }

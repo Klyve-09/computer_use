@@ -486,7 +486,7 @@ impl ComputerUse {
                     ActionKind::Drag { dst_x, dst_y, .. } => {
                         let (dst_obs, dst_monitor) = dst.unwrap();
                         post_monitor = dst_monitor.name.clone();
-                        let Some((dx, dy)) = backend::map_point(
+                        let Some((dst_ax, dst_ay)) = backend::map_point(
                             *dst_x,
                             *dst_y,
                             dst_obs.image_width,
@@ -516,8 +516,8 @@ impl ComputerUse {
                         for i in 1..=STEPS {
                             let t = i as f64 / STEPS as f64;
                             ops.push(PointerOp::Move {
-                                x: (ax as f64 + (dx as f64 - ax as f64) * t).round() as u32,
-                                y: (ay as f64 + (dy as f64 - ay as f64) * t).round() as u32,
+                                x: (ax as f64 + (dst_ax as f64 - ax as f64) * t).round() as u32,
+                                y: (ay as f64 + (dst_ay as f64 - ay as f64) * t).round() as u32,
                                 x_extent: layout.x_extent,
                                 y_extent: layout.y_extent,
                             });
@@ -769,8 +769,8 @@ impl ServerHandler for ComputerUse {
             "Screenshot-based control of the user's Hyprland desktop. \
              computer_monitors lists selectable monitors; computer_observe returns a \
              PNG screenshot and an opaque observation_id; computer_action performs one \
-             click/scroll/key/type_text action at observation coordinates and returns a \
-             fresh screenshot. Never repeat a partial/unknown action blindly."
+             click/scroll/key/type_text/drag action at observation coordinates and \
+             returns a fresh screenshot. Never repeat a partial/unknown action blindly."
                 .into(),
         );
         info

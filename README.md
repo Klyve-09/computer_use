@@ -97,8 +97,9 @@ observation of a monitor supersedes earlier IDs for that monitor.
 ## Limits
 
 - Capture bound: 10 s timeout, 48 MiB max PNG payload. `hyprctl` bound: 5 s.
-- Coordinates in returned images are screenshot pixels; the mapping into
-  desktop coordinates lives behind `computer_action` (not yet implemented).
+- Coordinates in returned images are screenshot pixels; `computer_action`
+  maps them into desktop coordinates server-side (fractional scale,
+  rotation, negative origins, gaps).
 - Screenshots are held in memory per request only; nothing is persisted.
 - If either notification channel is down, `actionable` reports `false`
   (`events_healthy` / `wayland_events_healthy` say which); observations still
