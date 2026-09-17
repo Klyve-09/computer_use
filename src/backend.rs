@@ -323,6 +323,300 @@ fn wayland_socket_path() -> Option<std::path::PathBuf> {
     Some(runtime_dir()?.join(wayland_display()?))
 }
 
+// ---------------------------------------------------------------------------
+// Persistent virtual pointer (zwlr_virtual_pointer_v1) + coordinate mapping.
+// ---------------------------------------------------------------------------
+
+/// evdev button codes used by Hyprland dispatchers and the pointer protocol.
+pub const BTN_LEFT: u32 = 272;
+pub const BTN_RIGHT: u32 = 273;
+
+/// Bounding rectangle of the complete logical monitor layout — the absolute
+/// frame an output-unmapped virtual pointer maps onto (Hyprland 0.56.2
+/// `warpAbsolute`: normalized position inside this box).
+pub struct LayoutBox {
+    pub min_x: i32,
+    pub min_y: i32,
+    pub x_extent: u32,
+    pub y_extent: u32,
+}
+
+pub fn layout_box(monitors: &[Monitor]) -> Option<LayoutBox> {
+    let mut min_x = i32::MAX;
+    let mut min_y = i32::MAX;
+    let mut max_x = i32::MIN;
+    let mut max_y = i32::MIN;
+    for m in monitors.iter().filter(|m| !m.disabled) {
+        let (w, h) = m.logical_size();
+        min_x = min_x.min(m.x);
+        min_y = min_y.min(m.y);
+        max_x = max_x.max(m.x + w as i32);
+        max_y = max_y.max(m.y + h as i32);
+    }
+    (max_x > min_x && max_y > min_y).then(|| LayoutBox {
+        min_x,
+        min_y,
+        x_extent: (max_x - min_x) as u32,
+        y_extent: (max_y - min_y) as u32,
+    })
+}
+
+/// Map a point in an observation image into the pointer's absolute frame.
+/// The image is already upright; it maps linearly onto the monitor's oriented
+/// logical rectangle, which is then offset into the layout bounding box.
+/// Returns (x, y) in the box's unsigned coordinate space, or None for
+/// out-of-bounds/non-finite input. Never clamps a wrong point.
+pub fn map_point(
+    px: f64,
+    py: f64,
+    image_w: u32,
+    image_h: u32,
+    monitor: &Monitor,
+    layout: &LayoutBox,
+) -> Option<(u32, u32)> {
+    if !px.is_finite() || !py.is_finite() || px < 0.0 || py < 0.0 {
+        return None;
+    }
+    if px >= image_w as f64 || py >= image_h as f64 || image_w == 0 || image_h == 0 {
+        return None;
+    }
+    let (lw, lh) = monitor.logical_size();
+    let gx = monitor.x as f64 + px * lw as f64 / image_w as f64;
+    let gy = monitor.y as f64 + py * lh as f64 / image_h as f64;
+    let ax = (gx - layout.min_x as f64).round();
+    let ay = (gy - layout.min_y as f64).round();
+    // abs coords are in [0, extent); rounding an edge pixel can reach extent.
+    let x = ax.clamp(0.0, (layout.x_extent - 1) as f64) as u32;
+    let y = ay.clamp(0.0, (layout.y_extent - 1) as f64) as u32;
+    Some((x, y))
+}
+
+#[derive(Debug)]
+pub enum PointerOp {
+    /// Absolute position + frame extents for this dispatch.
+    Move { x: u32, y: u32, x_extent: u32, y_extent: u32 },
+    Button { code: u32, pressed: bool },
+    /// Signed wheel steps; axis 0 = vertical, 1 = horizontal.
+    Scroll { axis: u8, steps: i32 },
+    Frame,
+}
+
+/// How far the compositor got, for the caller-visible `effect` field.
+#[derive(Debug, PartialEq)]
+pub enum Delivery {
+    None,
+    Completed,
+    /// Some ops dispatched, then transport failed.
+    Partial,
+    /// All ops dispatched but the sync roundtrip failed.
+    Unknown,
+}
+
+pub struct Pointer {
+    tx: std::sync::mpsc::Sender<(Vec<PointerOp>, std::sync::mpsc::Sender<Delivery>)>,
+}
+
+impl Pointer {
+    /// Spawns the pointer thread. Connection/protocol init happens lazily per
+    /// request and is retried after failures; the pointer object persists so
+    /// button state survives across calls (required for drags later).
+    pub fn start() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<(Vec<PointerOp>, std::sync::mpsc::Sender<Delivery>)>();
+        std::thread::spawn(move || {
+            let mut session: Option<pointer_session::Session> = None;
+            for (ops, reply) in rx {
+                if session.is_none() {
+                    session = pointer_session::Session::connect().ok();
+                }
+                let result = match session.as_mut() {
+                    None => Delivery::None,
+                    Some(s) => s.apply(&ops),
+                };
+                let _ = reply.send(result);
+                if session.as_ref().is_some_and(|s| s.broken) {
+                    session = None;
+                }
+            }
+        });
+        Self { tx }
+    }
+
+    /// Blocks until the op list is delivered or fails. Call from spawn_blocking.
+    pub fn apply(&self, ops: Vec<PointerOp>) -> Delivery {
+        let (reply, rx) = std::sync::mpsc::channel();
+        if self.tx.send((ops, reply)).is_err() {
+            return Delivery::None;
+        }
+        rx.recv().unwrap_or(Delivery::None)
+    }
+}
+
+mod pointer_session {
+    use super::{Delivery, PointerOp};
+        use wayland_client::globals::{GlobalListContents, registry_queue_init};
+    use wayland_client::protocol::{wl_output, wl_pointer, wl_registry};
+    use wayland_client::{Connection, Dispatch, QueueHandle};
+    use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1;
+    use wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1;
+    
+    pub struct Session {
+        conn: Connection,
+        pointer: ZwlrVirtualPointerV1,
+        held: std::collections::HashSet<u32>,
+        time_ms: u32,
+        pub broken: bool,
+    }
+
+    struct State;
+
+    impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
+        fn event(
+            _: &mut Self,
+            _: &wl_registry::WlRegistry,
+            _: wl_registry::Event,
+            _: &GlobalListContents,
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+    impl Dispatch<ZwlrVirtualPointerManagerV1, ()> for State {
+        fn event(
+            _: &mut Self,
+            _: &ZwlrVirtualPointerManagerV1,
+            _: <ZwlrVirtualPointerManagerV1 as wayland_client::Proxy>::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+    impl Dispatch<ZwlrVirtualPointerV1, ()> for State {
+        fn event(
+            _: &mut Self,
+            _: &ZwlrVirtualPointerV1,
+            _: <ZwlrVirtualPointerV1 as wayland_client::Proxy>::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+    impl Dispatch<wl_output::WlOutput, ()> for State {
+        fn event(
+            _: &mut Self,
+            _: &wl_output::WlOutput,
+            _: wl_output::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    impl Session {
+        pub fn connect() -> Result<Self, Box<dyn std::error::Error>> {
+            let path = super::wayland_socket_path().ok_or("no wayland session")?;
+            let stream = std::os::unix::net::UnixStream::connect(path)?;
+            let backend = wayland_client::backend::Backend::connect(stream)?;
+            let conn = Connection::from_backend(backend);
+            let (globals, mut queue) = registry_queue_init::<State>(&conn)?;
+            let mut state = State;
+            queue.roundtrip(&mut state)?;
+            let mut manager = None;
+            for g in globals.contents().clone_list() {
+                if g.interface == "zwlr_virtual_pointer_manager_v1" {
+                    manager = Some(globals.registry().bind::<ZwlrVirtualPointerManagerV1, _, _>(
+                        g.name,
+                        g.version.min(2),
+                        &queue.handle(),
+                        (),
+                    ));
+                }
+            }
+            let manager = manager.ok_or("zwlr_virtual_pointer_manager_v1 not advertised")?;
+            // v2: no seat/output mapping -> pointer covers the whole layout.
+            let pointer = manager.create_virtual_pointer_with_output(None, None, &queue.handle(), ());
+            queue.roundtrip(&mut state)?;
+            Ok(Self {
+                conn,
+                pointer,
+                held: Default::default(),
+                time_ms: 0,
+                broken: false,
+            })
+        }
+
+        fn tick(&mut self) -> u32 {
+            self.time_ms = self.time_ms.wrapping_add(1);
+            self.time_ms
+        }
+
+        /// Best-effort release of every held button, ignoring further errors.
+        fn release_all(&mut self) {
+            for code in self.held.drain().collect::<Vec<_>>() {
+                let t = self.tick();
+                self.pointer.button(t, code, wl_pointer::ButtonState::Released);
+            }
+            self.pointer.frame();
+            let _ = self.conn.flush();
+        }
+
+        pub fn apply(&mut self, ops: &[PointerOp]) -> Delivery {
+            let mut sent = false;
+            for op in ops {
+                let t = self.tick();
+                match *op {
+                    PointerOp::Move { x, y, x_extent, y_extent } => {
+                        self.pointer.motion_absolute(t, x, y, x_extent, y_extent);
+                    }
+                    PointerOp::Button { code, pressed } => {
+                        self.pointer.button(
+                            t,
+                            code,
+                            if pressed {
+                                wl_pointer::ButtonState::Pressed
+                            } else {
+                                wl_pointer::ButtonState::Released
+                            },
+                        );
+                        if pressed {
+                            self.held.insert(code);
+                        } else {
+                            self.held.remove(&code);
+                        }
+                    }
+                    PointerOp::Scroll { axis, steps } => {
+                        let axis_e = match axis {
+                            1 => wl_pointer::Axis::HorizontalScroll,
+                            _ => wl_pointer::Axis::VerticalScroll,
+                        };
+                        self.pointer.axis_discrete(t, axis_e, steps as f64 * 120.0, steps);
+                        self.pointer.axis(t, axis_e, steps as f64 * 120.0);
+                    }
+                    PointerOp::Frame => self.pointer.frame(),
+                }
+                sent = true;
+            }
+            if self.conn.flush().is_err() {
+                self.broken = true;
+                return if sent { Delivery::Partial } else { Delivery::None };
+            }
+            // Sync the connection: surfaces transport errors (e.g. protocol
+            // error, disconnect) instead of assuming the queue was accepted.
+            match self.conn.roundtrip() {
+                Ok(_) => Delivery::Completed,
+                Err(e) => {
+                    eprintln!("pointer roundtrip failed: {e}");
+                    self.release_all();
+                    self.broken = true;
+                    Delivery::Unknown
+                }
+            }
+        }
+    }
+}
+
 /// PNG IHDR dimensions, or None if not a PNG.
 pub fn png_size(png: &[u8]) -> Option<(u32, u32)> {
     if png.len() >= 24 && png[..8] == [137, 80, 78, 71, 13, 10, 26, 10] && &png[12..16] == b"IHDR" {
@@ -385,6 +679,67 @@ mod tests {
         let mut disabled_changed = base.clone();
         disabled_changed[0].disabled = true;
         assert_ne!(fingerprint(&base), fingerprint(&disabled_changed));
+    }
+
+    fn layout(ms: &[Monitor]) -> LayoutBox {
+        layout_box(ms).unwrap()
+    }
+
+    #[test]
+    fn map_point_single_scaled_monitor() {
+        // 2560x1440 @ 1.25 -> logical 2048x1152; image is physical size.
+        let m = mon("eDP-1", 0, 0, 2560, 1440, 1.25, 0);
+        let b = layout(&[m.clone()]);
+        assert_eq!(map_point(0.0, 0.0, 2560, 1440, &m, &b), Some((0, 0)));
+        // Center of the image -> center of the logical box.
+        assert_eq!(map_point(1280.0, 720.0, 2560, 1440, &m, &b), Some((1024, 576)));
+        // Last valid pixel stays inside.
+        let (x, y) = map_point(2559.0, 1439.0, 2560, 1440, &m, &b).unwrap();
+        assert!(x < b.x_extent && y < b.y_extent);
+        assert_eq!((x, y), (2047, 1151));
+    }
+
+    #[test]
+    fn map_point_negative_origin_second_monitor() {
+        // Left monitor at negative x, scale 1; right at 0, scale 2.
+        let left = mon("DP-1", -1920, 0, 1920, 1080, 1.0, 0);
+        let right = mon("eDP-1", 0, 0, 3840, 2160, 2.0, 0); // logical 1920x1080
+        let b = layout(&[left.clone(), right.clone()]);
+        assert_eq!((b.min_x, b.min_y, b.x_extent, b.y_extent), (-1920, 0, 3840, 1080));
+        // Center of left monitor's image -> (-960, 540) global -> (960, 540) abs.
+        assert_eq!(map_point(960.0, 540.0, 1920, 1080, &left, &b), Some((960, 540)));
+        // Center of right monitor's image -> (960, 540) global -> (2880, 540).
+        assert_eq!(map_point(1920.0, 1080.0, 3840, 2160, &right, &b), Some((2880, 540)));
+    }
+
+    #[test]
+    fn map_point_rotated_monitor() {
+        // Portrait: transform 1 swaps logical axes -> logical 1440x2560.
+        let m = mon("DP-1", 0, 0, 2560, 1440, 1.0, 1);
+        let b = layout(&[m.clone()]);
+        assert_eq!((b.x_extent, b.y_extent), (1440, 2560));
+        // Image is already upright; bottom-right image pixel -> bottom-right of box.
+        assert_eq!(map_point(1439.0, 2559.0, 1440, 2560, &m, &b), Some((1439, 2559)));
+    }
+
+    #[test]
+    fn map_point_rejects_bad_input() {
+        let m = mon("eDP-1", 0, 0, 2560, 1440, 1.25, 0);
+        let b = layout(&[m.clone()]);
+        for (px, py) in [
+            (2560.0, 0.0), (-1.0, 0.0), (0.0, 1440.0),
+            (f64::NAN, 0.0), (f64::INFINITY, 0.0), (0.0, f64::NEG_INFINITY),
+        ] {
+            assert_eq!(map_point(px, py, 2560, 1440, &m, &b), None);
+        }
+    }
+
+    #[test]
+    fn layout_box_empty_without_monitors() {
+        assert!(layout_box(&[]).is_none());
+        let mut disabled = mon("a", 0, 0, 100, 100, 1.0, 0);
+        disabled.disabled = true;
+        assert!(layout_box(&[disabled]).is_none());
     }
 
     #[test]

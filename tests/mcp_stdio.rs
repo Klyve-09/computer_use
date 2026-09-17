@@ -133,6 +133,40 @@ fn monitors_then_observe_real_display() {
 }
 
 #[test]
+fn action_rejects_stale_and_invalid_without_input() {
+    let Some(mut c) = Client::start() else { return };
+    init(&mut c);
+
+    // Unknown observation -> STALE_OBSERVATION, isError, no side effect.
+    let stale = c.call_tool(
+        "computer_action",
+        json!({"observation_id": "bogus", "action": {"kind": "click", "x": 10, "y": 10, "button": "left"}}),
+    );
+    assert_eq!(stale["result"]["isError"], json!(true), "{stale}");
+    assert_eq!(stale["result"]["structuredContent"]["error"]["code"], "STALE_OBSERVATION");
+
+    // Out-of-bounds point -> INVALID_COORDINATES, rejected before input.
+    let obs = c.call_tool("computer_observe", json!({"monitor": "eDP-1"}));
+    let oid = obs["result"]["structuredContent"]["observation_id"].as_str().unwrap().to_string();
+    let w = obs["result"]["structuredContent"]["image"]["width_px"].as_u64().unwrap();
+    let bad = c.call_tool(
+        "computer_action",
+        json!({"observation_id": oid, "action": {"kind": "click", "x": w + 50, "y": 0, "button": "left"}}),
+    );
+    assert_eq!(bad["result"]["isError"], json!(true), "{bad}");
+    assert_eq!(bad["result"]["structuredContent"]["error"]["code"], "INVALID_COORDINATES");
+
+    // A superseded observation is rejected too.
+    let obs2 = c.call_tool("computer_observe", json!({"monitor": "eDP-1"}));
+    assert!(obs2["result"]["structuredContent"]["observation_id"].is_string());
+    let superseded = c.call_tool(
+        "computer_action",
+        json!({"observation_id": oid, "action": {"kind": "click", "x": 10, "y": 10, "button": "left"}}),
+    );
+    assert_eq!(superseded["result"]["structuredContent"]["error"]["code"], "STALE_OBSERVATION");
+}
+
+#[test]
 fn unknown_tool_is_protocol_error() {
     let Some(mut c) = Client::start() else { return };
     init(&mut c);
