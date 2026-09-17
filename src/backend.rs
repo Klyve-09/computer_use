@@ -221,7 +221,106 @@ pub fn watch_events(generation: Arc<AtomicU64>, healthy: Arc<AtomicBool>) -> tok
 fn event_socket_path() -> Option<std::path::PathBuf> {
     let his = hyprland_signature()?;
     let runtime = runtime_dir()?;
-    Some(std::path::Path::new(&runtime).join("hypr").join(his).join(".socket2.sock"))
+    Some(runtime.join("hypr").join(his).join(".socket2.sock"))
+}
+
+/// Hyprland's IPC socket does NOT emit an event for every display change:
+/// verified on 0.56.2 that `hl.monitor({scale=...})` changes the fingerprint
+/// with no monitoradded/removed/configreloaded event. The spec therefore
+/// requires a compositor-level output notification channel: a wl_output
+/// listener bumps the generation on every output event, which catches
+/// scale/mode/geometry/transform reconfigures the IPC socket misses
+/// (including change-and-restore, since the listener is continuously
+/// connected and sees both halves).
+pub fn watch_wayland_outputs(
+    generation: Arc<AtomicU64>,
+    healthy: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    use wayland_client::protocol::{wl_output, wl_registry};
+    use wayland_client::{Connection, Dispatch, QueueHandle};
+
+    struct Watcher {
+        generation: Arc<AtomicU64>,
+    }
+
+    impl Dispatch<wl_registry::WlRegistry, wayland_client::globals::GlobalListContents> for Watcher {
+        fn event(
+            state: &mut Self,
+            registry: &wl_registry::WlRegistry,
+            event: wl_registry::Event,
+            _: &wayland_client::globals::GlobalListContents,
+            _: &Connection,
+            qhandle: &QueueHandle<Self>,
+        ) {
+            // Only post-initial-roundtrip events reach us; initial globals are
+            // bound from GlobalList::contents() below.
+            if let wl_registry::Event::Global { name, interface, version } = event {
+                if interface == "wl_output" {
+                    registry.bind::<wl_output::WlOutput, _, _>(name, version.min(4), qhandle, ());
+                }
+            }
+            // Any global appearing/disappearing may be a display change.
+            state.generation.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Dispatch<wl_output::WlOutput, ()> for Watcher {
+        fn event(
+            state: &mut Self,
+            _: &wl_output::WlOutput,
+            _: wl_output::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            state.generation.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    std::thread::spawn(move || loop {
+        let Some(path) = wayland_socket_path() else {
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        };
+        let run = || -> Result<(), Box<dyn std::error::Error>> {
+            let stream = std::os::unix::net::UnixStream::connect(path)?;
+            let backend = wayland_client::backend::Backend::connect(stream)?;
+            let conn = Connection::from_backend(backend);
+            let (globals, mut queue) =
+                wayland_client::globals::registry_queue_init::<Watcher>(&conn)?;
+            let mut watcher = Watcher {
+                generation: generation.clone(),
+            };
+            // Bind every currently advertised output; new ones are bound via
+            // the forwarded registry events above.
+            for global in globals.contents().clone_list() {
+                if global.interface == "wl_output" {
+                    globals.registry().bind::<wl_output::WlOutput, _, _>(
+                        global.name,
+                        global.version.min(4),
+                        &queue.handle(),
+                        (),
+                    );
+                }
+            }
+            queue.roundtrip(&mut watcher)?;
+            healthy.store(true, Ordering::SeqCst);
+            loop {
+                queue.blocking_dispatch(&mut watcher)?;
+            }
+        };
+        if let Err(e) = run() {
+            eprintln!("wayland output watcher disconnected: {e}");
+        }
+        // Connection lost: we may have missed a change-and-restore.
+        healthy.store(false, Ordering::SeqCst);
+        generation.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_secs(1));
+    })
+}
+
+fn wayland_socket_path() -> Option<std::path::PathBuf> {
+    Some(runtime_dir()?.join(wayland_display()?))
 }
 
 /// PNG IHDR dimensions, or None if not a PNG.

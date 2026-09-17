@@ -46,10 +46,19 @@ One command; no env flags needed because of the session discovery above.
 | `computer_observe` | `{"monitor": "<id>"}` → PNG image block, `observation_id`, actual image dimensions, monitor summary, `revision`, `actionable`. |
 
 Observations are bound to a session epoch + event-driven generation + a
-geometry fingerprint. Any `monitoradded*`/`monitorremoved*`/`configreloaded`
-event, event-socket loss, or server restart invalidates earlier observation
-IDs; a change-and-restore also invalidates because the generation advances
-even when the fingerprint returns to its previous value.
+geometry fingerprint. Two notification channels advance the generation:
+
+1. The Hyprland IPC event socket (`monitoradded*`, `monitorremoved*`,
+   `configreloaded`; any disconnect also invalidates).
+2. A `wl_output` listener — required because Hyprland 0.56.2's IPC socket
+   emits **no** event for runtime reconfigures like
+   `hl.monitor({scale = ...})`. Verified live: the IPC socket stayed silent
+   while `wl_output` delivered scale/mode/geometry/done events.
+
+A change-and-restore still invalidates: both channels are continuously
+connected, so they observe each half of the transition. A server restart
+changes the epoch, invalidating every old observation ID. A newer
+observation of a monitor supersedes earlier IDs for that monitor.
 
 ## Limits
 
@@ -57,11 +66,14 @@ even when the fingerprint returns to its previous value.
 - Coordinates in returned images are screenshot pixels; the mapping into
   desktop coordinates lives behind `computer_action` (not yet implemented).
 - Screenshots are held in memory per request only; nothing is persisted.
-- If the Hyprland event socket is unavailable, `actionable` reports `false`
-  and `events_healthy` is `false`; observations still return for diagnostics.
-- Change-and-restore that happens *between* the event socket's loss and its
-  reconnect cannot be distinguished — that's why every disconnect bumps the
+- If either notification channel is down, `actionable` reports `false`
+  (`events_healthy` / `wayland_events_healthy` say which); observations still
+  return for diagnostics.
+- Change-and-restore that happens *between* a channel's loss and reconnect
+  cannot be distinguished — that's why every disconnect bumps the
   generation unconditionally.
+- `wl_output` reports integer scale factors only; it is used purely as an
+  invalidation signal, never for coordinate math.
 
 ## Verification
 

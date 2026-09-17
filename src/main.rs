@@ -34,6 +34,7 @@ struct State {
     epoch: Uuid,
     generation: Arc<AtomicU64>,
     events_healthy: Arc<AtomicBool>,
+    wayland_healthy: Arc<AtomicBool>,
     observations: Mutex<HashMap<String, Observation>>,
 }
 
@@ -41,6 +42,13 @@ impl State {
     /// Opaque Display Configuration revision: session epoch + event-driven
     /// generation + snapshot fingerprint. A change-and-restore still bumps the
     /// generation, and a server restart changes the epoch.
+    /// An observation is actionable only while both notification channels are
+    /// connected: the Hyprland IPC socket and the wl_output listener (which
+    /// covers reconfigures the IPC socket never reports).
+    fn actionable(&self) -> bool {
+        self.events_healthy.load(Ordering::SeqCst) && self.wayland_healthy.load(Ordering::SeqCst)
+    }
+
     fn revision(&self, fingerprint: u64) -> String {
         format!("{}-{}-{:016x}", self.epoch, self.generation.load(Ordering::SeqCst), fingerprint)
     }
@@ -75,9 +83,11 @@ impl ComputerUse {
             epoch: Uuid::new_v4(),
             generation: Arc::new(AtomicU64::new(0)),
             events_healthy: Arc::new(AtomicBool::new(false)),
+            wayland_healthy: Arc::new(AtomicBool::new(false)),
             observations: Mutex::new(HashMap::new()),
         });
         backend::watch_events(state.generation.clone(), state.events_healthy.clone());
+        backend::watch_wayland_outputs(state.generation.clone(), state.wayland_healthy.clone());
         Self {
             state,
             tool_router: Self::tool_router(),
@@ -106,11 +116,8 @@ fn ok_result(value: serde_json::Value, image_png: Option<Vec<u8>>) -> Result<Cal
     Ok(result)
 }
 
-fn err_result(code: &str, message: impl Into<String>, extra: Option<serde_json::Value>) -> Result<CallToolResult, McpError> {
-    let mut value = serde_json::json!({ "error": { "code": code, "message": message.into() } });
-    if let Some(e) = extra {
-        value.as_object_mut().unwrap().extend(e.as_object().unwrap().clone());
-    }
+fn err_result(code: &str, message: impl Into<String>) -> Result<CallToolResult, McpError> {
+    let value = serde_json::json!({ "error": { "code": code, "message": message.into() } });
     let mut result = CallToolResult::error(vec![Content::text(value.to_string())]);
     result.structured_content = Some(value);
     Ok(result)
@@ -123,7 +130,7 @@ fn backend_error(e: BackendError) -> Result<CallToolResult, McpError> {
         BackendError::TooLarge(_) => "CAPTURE_TOO_LARGE",
         BackendError::Failed(_) => "BACKEND_FAILED",
     };
-    err_result(code, e.to_string(), None)
+    err_result(code, e.to_string())
 }
 
 #[tool_router]
@@ -142,6 +149,7 @@ impl ComputerUse {
             serde_json::json!({
                 "revision": self.state.revision(fingerprint),
                 "events_healthy": self.state.events_healthy.load(Ordering::SeqCst),
+                "wayland_events_healthy": self.state.wayland_healthy.load(Ordering::SeqCst),
                 "monitors": monitors.iter().map(Self::monitor_summary).collect::<Vec<_>>(),
             }),
             None,
@@ -165,7 +173,6 @@ impl ComputerUse {
                 return err_result(
                     "MONITOR_NOT_FOUND",
                     format!("no selectable monitor {:?}; call computer_monitors", p.monitor),
-                    None,
                 );
             };
             let gen_pre = self.state.generation.load(Ordering::SeqCst);
@@ -184,10 +191,14 @@ impl ComputerUse {
                 continue;
             }
             let Some((w, h)) = backend::png_size(&png) else {
-                return err_result("CAPTURE_FAILED", "grim output was not a PNG", None);
+                return err_result("CAPTURE_FAILED", "grim output was not a PNG");
             };
             let observation_id = Uuid::new_v4().to_string();
-            self.state.observations.lock().unwrap().insert(
+            // Keep only the latest observation per monitor: a newer capture
+            // supersedes earlier observation IDs for the same output.
+            let mut observations = self.state.observations.lock().unwrap();
+            observations.retain(|_, o| o.monitor != monitor.name);
+            observations.insert(
                 observation_id.clone(),
                 Observation {
                     monitor: monitor.name.clone(),
@@ -203,7 +214,7 @@ impl ComputerUse {
                     "monitor": Self::monitor_summary(monitor),
                     "image": { "width_px": w, "height_px": h, "mime_type": "image/png" },
                     "revision": self.state.revision(fp_post),
-                    "actionable": self.state.events_healthy.load(Ordering::SeqCst),
+                    "actionable": self.state.actionable(),
                 }),
                 Some(png),
             );
@@ -211,7 +222,6 @@ impl ComputerUse {
         err_result(
             "DISPLAY_CONFIGURATION_CHANGED",
             "display configuration changed during capture; call computer_observe again",
-            None,
         )
     }
 }
@@ -253,6 +263,7 @@ mod tests {
             epoch: Uuid::new_v4(),
             generation: Arc::new(AtomicU64::new(0)),
             events_healthy: Arc::new(AtomicBool::new(true)),
+            wayland_healthy: Arc::new(AtomicBool::new(true)),
             observations: Mutex::new(HashMap::new()),
         }
     }
@@ -285,6 +296,28 @@ mod tests {
         insert_observation(&state, "obs-1");
         state.generation.fetch_add(1, Ordering::SeqCst);
         assert!(state.observation_current("obs-1").is_err());
+    }
+
+    #[test]
+    fn newer_observation_supersedes_same_monitor() {
+        let state = test_state();
+        insert_observation(&state, "obs-old");
+        // Simulate the observe path: keep only latest per monitor.
+        let mut observations = state.observations.lock().unwrap();
+        observations.retain(|_, o| o.monitor != "eDP-1");
+        observations.insert(
+            "obs-new".to_string(),
+            Observation {
+                monitor: "eDP-1".into(),
+                image_width: 100,
+                image_height: 100,
+                generation: 0,
+                fingerprint: 0,
+            },
+        );
+        drop(observations);
+        assert!(state.observation_current("obs-old").is_err());
+        assert!(state.observation_current("obs-new").is_ok());
     }
 
     #[test]
