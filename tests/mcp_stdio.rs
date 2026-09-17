@@ -497,6 +497,22 @@ fn focus_fixture(rig: &Rig, monitor_id: i64) {
     );
 }
 
+/// Unix listener that accepts peers, holds them open without ever
+/// replying, and reports each accept on the returned channel — the
+/// "wedged input backend" fixture.
+fn silent_listener(sock: &std::path::Path) -> std::sync::mpsc::Receiver<()> {
+    let listener = std::os::unix::net::UnixListener::bind(sock).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut held = Vec::new(); // keep peers alive so connects stay wedged
+        while let Ok((peer, _)) = listener.accept() {
+            let _ = tx.send(());
+            held.push(peer);
+        }
+    });
+    rx
+}
+
 /// A config event arriving mid-post-action-capture must never produce an
 /// `outcome: ok` result with a fresh actionable observation (review P1).
 #[test]
@@ -588,18 +604,10 @@ fn clipboard_replaced_then_aborted_paste_reports_partial() {
 fn wedged_input_connection_times_out_and_recovers() {
     let rig = event_rig();
     let sock = rig.dir.join("input.sock");
-    let silent = std::os::unix::net::UnixListener::bind(&sock).unwrap();
     // The accept channel proves the worker reached the wedged-roundtrip
     // stage, so the assertions below cannot pass on an unrelated setup
     // failure before the intended timeout/cancellation path.
-    let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut held = Vec::new(); // keep peers alive so connects stay wedged
-        while let Ok((peer, _)) = silent.accept() {
-            let _ = accepted_tx.send(());
-            held.push(peer);
-        }
-    });
+    let accepted_rx = silent_listener(&sock);
     let mut env = rig_env(&rig);
     env.push((
         "COMPUTER_USE_INPUT_SOCKET".into(),
@@ -610,7 +618,8 @@ fn wedged_input_connection_times_out_and_recovers() {
     };
     init(&mut c);
     std::thread::sleep(std::time::Duration::from_millis(300));
-    let obs = c.call_tool("computer_observe", json!({"monitor": "eDP-1"}));
+    let (mon, _) = first_monitor();
+    let obs = c.call_tool("computer_observe", json!({"monitor": mon}));
     let oid = obs["result"]["structuredContent"]["observation_id"]
         .as_str()
         .unwrap()
@@ -661,15 +670,7 @@ fn cancelled_queued_action_runs_no_side_effects() {
     // Silent input socket: accepts, never answers, so the first action holds
     // the action lock stuck in a Wayland roundtrip.
     let sock = rig.dir.join("input.sock");
-    let silent = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-    let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut held = Vec::new();
-        while let Ok((peer, _)) = silent.accept() {
-            let _ = accepted_tx.send(());
-            held.push(peer);
-        }
-    });
+    let accepted_rx = silent_listener(&sock);
     let mut env = rig_env(&rig);
     env.push((
         "COMPUTER_USE_INPUT_SOCKET".into(),
@@ -858,11 +859,15 @@ fn clipboard_blocked_stdin_is_bounded_and_cancellable() {
     let (mon, mon_id) = first_monitor();
     focus_fixture(&rig, mon_id);
     // Never reads stdin: a payload larger than the 64KiB pipe buffer
-    // blocks write_all indefinitely without the fix.
+    // blocks write_all indefinitely without the fix. Records its pid so
+    // the test can verify the cancelled child was killed and reaped.
     script(
         &rig,
         "wl-copy",
-        "#!/usr/bin/python3\nimport time\ntime.sleep(30)\n",
+        &format!(
+            "#!/usr/bin/python3\nimport os,pathlib,time\npathlib.Path(\"{d}/child-pid\").write_text(str(os.getpid()))\ntime.sleep(30)\n",
+            d = rig.dir.display()
+        ),
     );
     let Some(mut c) = Client::start_with(&rig_env(&rig)) else {
         return;
@@ -870,6 +875,29 @@ fn clipboard_blocked_stdin_is_bounded_and_cancellable() {
     init(&mut c);
     std::thread::sleep(std::time::Duration::from_millis(300));
     let big = "x".repeat(262144);
+
+    // Oversized payloads are rejected before wl-copy ever spawns.
+    let obs = c.call_tool("computer_observe", json!({"monitor": mon}));
+    let oid = obs["result"]["structuredContent"]["observation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let too_big = c.call_tool(
+        "computer_action",
+        json!({"observation_id": oid, "action": {"kind": "type_text", "text": "x".repeat(1024 * 1024 + 1)}}),
+    );
+    assert_eq!(
+        too_big["result"]["structuredContent"]["error"]["code"], "PAYLOAD_TOO_LARGE",
+        "{too_big}"
+    );
+    assert_eq!(
+        too_big["result"]["structuredContent"]["effect"], "none",
+        "{too_big}"
+    );
+    assert!(
+        !rig.dir.join("child-pid").exists(),
+        "oversized type_text spawned wl-copy"
+    );
 
     // Phase 1: the deadline bounds the blocked write itself.
     let obs = c.call_tool("computer_observe", json!({"monitor": mon}));
@@ -933,5 +961,16 @@ fn clipboard_blocked_stdin_is_bounded_and_cancellable() {
     assert_eq!(
         done["result"]["structuredContent"]["error"]["code"], "STALE_OBSERVATION",
         "{done}"
+    );
+    // The cancelled child was killed and reaped before the lock released:
+    // a zombie or live wl-copy would still show up in /proc.
+    let pid: u32 = std::fs::read_to_string(rig.dir.join("child-pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "cancelled wl-copy (pid {pid}) was not killed and reaped"
     );
 }

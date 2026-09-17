@@ -8,6 +8,9 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
 pub const HYPRCTL_TIMEOUT: Duration = Duration::from_secs(5);
+/// Deadline for the complete wl-copy write+wait; a separate budget from
+/// hyprctl's so neither's tuning silently changes the other.
+const WL_COPY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const GRIM_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_CAPTURE_BYTES: usize = 48 * 1024 * 1024;
 
@@ -204,7 +207,7 @@ pub async fn clipboard_set(text: &str, abort: &Abort) -> Result<(), BackendError
     }
     let outcome = tokio::select! {
         r = op => Ok(r),
-        _ = tokio::time::sleep(HYPRCTL_TIMEOUT) => Err(Stop::Timeout),
+        _ = tokio::time::sleep(WL_COPY_TIMEOUT) => Err(Stop::Timeout),
         _ = abort.wait_cancelled() => Err(Stop::Cancelled),
     };
     let (write_result, status) = match outcome {

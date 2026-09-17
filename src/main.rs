@@ -448,6 +448,13 @@ impl ComputerUse {
                 }
             }
             ActionKind::TypeText { text, paste } => {
+                // Bound the clipboard payload before spawning wl-copy.
+                if text.len() > MAX_TYPE_TEXT_BYTES {
+                    return action_err(
+                        "PAYLOAD_TOO_LARGE",
+                        format!("text exceeds the {MAX_TYPE_TEXT_BYTES} byte limit"),
+                    );
+                }
                 // Validate the paste mode before touching the clipboard: an
                 // invalid value must be a rejection, not a clipboard clobber.
                 let mods: Vec<String> = match paste.as_deref().unwrap_or("ctrl_v") {
@@ -724,6 +731,10 @@ impl ComputerUse {
         }
     }
 }
+
+/// Payload bound for type_text: clipboard replacement of huge text is
+/// rejected before wl-copy spawns.
+const MAX_TYPE_TEXT_BYTES: usize = 1024 * 1024;
 
 /// Modifier name -> xkb modifier name on the uploaded keymap.
 fn modifier(name: &str) -> Option<&'static str> {
