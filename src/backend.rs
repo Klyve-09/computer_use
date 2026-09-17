@@ -492,6 +492,10 @@ pub enum PointerOp {
         axis: u8,
         steps: i32,
     },
+    /// Pause between events so clients see a drag gesture, not a jump.
+    Wait {
+        ms: u32,
+    },
     Frame,
 }
 
@@ -706,6 +710,12 @@ mod pointer_session {
                         self.pointer
                             .axis_discrete(t, axis_e, steps as f64 * 120.0, steps);
                         self.pointer.axis(t, axis_e, steps as f64 * 120.0);
+                    }
+                    PointerOp::Wait { ms } => {
+                        // Flush before sleeping so earlier events are already
+                        // on the wire; caps keep one action bounded.
+                        let _ = self.conn.flush();
+                        std::thread::sleep(std::time::Duration::from_millis(ms.min(2000) as u64));
                     }
                     PointerOp::Frame => self.pointer.frame(),
                 }

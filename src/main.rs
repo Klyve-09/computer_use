@@ -52,6 +52,18 @@ pub enum ActionKind {
         #[serde(default)]
         mods: Vec<String>,
     },
+    /// Drag from a point in this observation's image to a point in the
+    /// destination observation's image (may be a different monitor). One
+    /// move/press/move/release sequence; endpoints are mapped independently.
+    Drag {
+        x: f64,
+        y: f64,
+        /// observation_id of the destination observation (same or another
+        /// monitor); must be current under the same Display Configuration.
+        dst_observation_id: String,
+        dst_x: f64,
+        dst_y: f64,
+    },
     /// Enter exact UTF-8 text via clipboard + paste shortcut.
     /// Replaces the clipboard. `paste`: "ctrl_v" (default) or
     /// "ctrl_shift_v" (terminals).
@@ -326,10 +338,11 @@ impl ComputerUse {
         )
     }
 
-    /// Execute one click, scroll, key, or type_text Action against the
+    /// Execute one click, scroll, key, type_text, or drag Action against the
     /// referenced observation, then return a fresh observation of that
-    /// Monitor. type_text replaces the clipboard; key/type_text act on the
-    /// focused window, which must live on the observed monitor.
+    /// Monitor (the drag destination for drags). type_text replaces the
+    /// clipboard; key/type_text act on the focused window, which must live on
+    /// the observed monitor.
     /// Input coordinates are image pixels; the server performs all scaling.
     /// Serialized with every other action. On partial/unknown delivery or a
     /// failed post-action capture, do NOT repeat the action — call
@@ -382,6 +395,8 @@ impl ComputerUse {
             }
         }
 
+        // Post-action observation target: the drag destination monitor.
+        let mut post_monitor = obs.monitor.clone();
         let delivery = match &p.action {
             ActionKind::Key { key, mods } => {
                 if let Some(bad) = mods.iter().find(|m| modifier(m).is_none()) {
@@ -410,12 +425,41 @@ impl ComputerUse {
                 };
                 type_text(&self.keyboard, text, mods).await
             }
-            ActionKind::Click { .. } | ActionKind::Scroll { .. } => {
+            ActionKind::Click { .. } | ActionKind::Scroll { .. } | ActionKind::Drag { .. } => {
                 let Some(layout) = backend::layout_box(&snapshot) else {
                     return action_err("NO_LAYOUT", "no selectable monitors");
                 };
+                // Drag resolves its destination observation BEFORE any press:
+                // it must be current under the same Display Configuration.
+                let dst = match &p.action {
+                    ActionKind::Drag {
+                        dst_observation_id, ..
+                    } => {
+                        let dst_obs = match self.state.validate_observation(dst_observation_id, fp)
+                        {
+                            Ok(o) => o,
+                            Err(msg) => {
+                                return action_err(
+                                    "STALE_OBSERVATION",
+                                    format!("destination: {msg}; observe the destination again"),
+                                );
+                            }
+                        };
+                        let Some(dst_monitor) = snapshot.iter().find(|m| m.name == dst_obs.monitor)
+                        else {
+                            return action_err(
+                                "MONITOR_NOT_FOUND",
+                                "destination observation's monitor is gone",
+                            );
+                        };
+                        Some((dst_obs, dst_monitor))
+                    }
+                    _ => None,
+                };
                 let (px, py) = match &p.action {
-                    ActionKind::Click { x, y, .. } | ActionKind::Scroll { x, y, .. } => (*x, *y),
+                    ActionKind::Click { x, y, .. }
+                    | ActionKind::Scroll { x, y, .. }
+                    | ActionKind::Drag { x, y, .. } => (*x, *y),
                     _ => unreachable!(),
                 };
                 let Some((ax, ay)) =
@@ -439,6 +483,53 @@ impl ComputerUse {
                     PointerOp::Frame,
                 ];
                 match &p.action {
+                    ActionKind::Drag { dst_x, dst_y, .. } => {
+                        let (dst_obs, dst_monitor) = dst.unwrap();
+                        post_monitor = dst_monitor.name.clone();
+                        let Some((dx, dy)) = backend::map_point(
+                            *dst_x,
+                            *dst_y,
+                            dst_obs.image_width,
+                            dst_obs.image_height,
+                            dst_monitor,
+                            &layout,
+                        ) else {
+                            return action_err(
+                                "INVALID_COORDINATES",
+                                format!(
+                                    "destination point ({dst_x}, {dst_y}) is outside the {}x{} image",
+                                    dst_obs.image_width, dst_obs.image_height
+                                ),
+                            );
+                        };
+                        // One move/press/move/release sequence. A straight
+                        // jump registers as a selection, not a drag, in most
+                        // toolkits — so hold briefly, then emit a bounded
+                        // number of interpolated steps before releasing.
+                        ops.push(PointerOp::Button {
+                            code: backend::BTN_LEFT,
+                            pressed: true,
+                        });
+                        ops.push(PointerOp::Frame);
+                        ops.push(PointerOp::Wait { ms: 250 });
+                        const STEPS: u32 = 8;
+                        for i in 1..=STEPS {
+                            let t = i as f64 / STEPS as f64;
+                            ops.push(PointerOp::Move {
+                                x: (ax as f64 + (dx as f64 - ax as f64) * t).round() as u32,
+                                y: (ay as f64 + (dy as f64 - ay as f64) * t).round() as u32,
+                                x_extent: layout.x_extent,
+                                y_extent: layout.y_extent,
+                            });
+                            ops.push(PointerOp::Frame);
+                            ops.push(PointerOp::Wait { ms: 20 });
+                        }
+                        ops.push(PointerOp::Button {
+                            code: backend::BTN_LEFT,
+                            pressed: false,
+                        });
+                        ops.push(PointerOp::Frame);
+                    }
                     ActionKind::Click { button, double, .. } => {
                         let code = match button {
                             ClickButton::Left => backend::BTN_LEFT,
@@ -515,9 +606,9 @@ impl ComputerUse {
             );
         }
 
-        // Post-action observation on the same monitor (if it still exists).
+        // Post-action observation on the target monitor (drag destination).
         let post_obs = match &post {
-            Ok(ms) => match ms.iter().find(|m| m.name == obs.monitor) {
+            Ok(ms) => match ms.iter().find(|m| m.name == post_monitor) {
                 Some(m) => match backend::capture(&m.name).await {
                     Ok(png) => match backend::png_size(&png) {
                         Some((w, h)) => Some((m.clone(), png, w, h)),

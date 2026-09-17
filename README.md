@@ -7,11 +7,11 @@ Approved specification: GitHub issue
 
 ## Status
 
-Implemented (issues #2–#4): `computer_monitors`, `computer_observe`, and
+Implemented (issues #2–#5): `computer_monitors`, `computer_observe`, and
 `computer_action` — click/right-click/double-click, signed horizontal and
-vertical scroll, single keys and modifier chords, and `type_text` (exact
-UTF-8 text via clipboard + paste shortcut). Drag arrives in issue #5;
-recovery hardening in #6.
+vertical scroll, single keys and modifier chords, `type_text` (exact UTF-8
+text via clipboard + paste shortcut), and `drag` within or between
+monitors. Recovery hardening in #6.
 
 ## Requirements
 
@@ -60,6 +60,14 @@ Action kinds:
 - `type_text` — `{text: "<exact UTF-8>", paste: "ctrl_v"|"ctrl_shift_v"}`.
   **Replaces the user's clipboard** (that side effect is reported even when
   paste fails). `ctrl_v` is the default; use `ctrl_shift_v` for terminals.
+- `drag` — `{x, y, dst_observation_id, dst_x, dst_y}`. One
+  move/press/move/release on the persistent pointer: press at the source
+  image point, hold 250 ms, eight interpolated steps (~20 ms apart) so
+  toolkits recognize a drag rather than a jump, release at the destination.
+  Both endpoints resolve independently from their own observations, which
+  must be current under the same Display Configuration — a stale or
+  disconnected destination rejects before the press. The post-action
+  observation is captured on the *destination* monitor.
 
 `key`/`type_text` require the observed monitor to contain the focused window
 (`FOCUS_MISMATCH` otherwise — click the target first). Keyboard input goes
@@ -138,6 +146,15 @@ Live evidence (Hyprland 0.56.2, scale 1.25, fcitx5 IME present):
   `computer_observe` → click Firefox's address bar → `type_text
   "example.com"` → `key Return` → `computer_observe` showing the loaded
   Example Domain page; every action reported `effect: completed`.
+- Drag: a press+move+release in gnome-text-editor produced a live text
+  selection; a drag from a selected block in a gte window on HEADLESS-3 to
+  an empty gte window on eDP-1 dropped the text into the destination
+  document (verified visually — the destination buffer shows the dragged
+  lines). A `hl.monitor({scale})` change racing a drag returned
+  `outcome: partial` + `display_changed_during_action` + `do_not_replay`
+  with a fresh destination observation; the button was released.
+  Headless-output evidence is labelled as such — a virtual output shares the
+  compositor code path but is not a physical panel.
 
 Not verified: bare letter keys under a composing IME are transformed (by
 design — same as a physical keyboard); non-US physical layouts are

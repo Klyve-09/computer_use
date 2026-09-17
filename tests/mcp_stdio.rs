@@ -270,6 +270,46 @@ fn key_and_text_rejections() {
 }
 
 #[test]
+fn drag_rejects_stale_or_bad_destination() {
+    let Some(mut c) = Client::start() else { return };
+    init(&mut c);
+    let obs = c.call_tool("computer_observe", json!({"monitor": "eDP-1"}));
+    let oid = obs["result"]["structuredContent"]["observation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Unknown destination observation -> rejected before any press.
+    let stale_dst = c.call_tool(
+        "computer_action",
+        json!({"observation_id": oid, "action": {"kind": "drag", "x": 10, "y": 10, "dst_observation_id": "bogus", "dst_x": 20, "dst_y": 20}}),
+    );
+    assert_eq!(
+        stale_dst["result"]["structuredContent"]["error"]["code"], "STALE_OBSERVATION",
+        "{stale_dst}"
+    );
+    assert_eq!(stale_dst["result"]["structuredContent"]["effect"], "none");
+
+    // Destination point outside its image -> INVALID_COORDINATES.
+    let obs2 = c.call_tool("computer_observe", json!({"monitor": "eDP-1"}));
+    let oid2 = obs2["result"]["structuredContent"]["observation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let dw = obs2["result"]["structuredContent"]["image"]["width_px"]
+        .as_u64()
+        .unwrap();
+    let bad_dst = c.call_tool(
+        "computer_action",
+        json!({"observation_id": oid2, "action": {"kind": "drag", "x": 10, "y": 10, "dst_observation_id": oid2, "dst_x": dw + 100, "dst_y": 0}}),
+    );
+    assert_eq!(
+        bad_dst["result"]["structuredContent"]["error"]["code"], "INVALID_COORDINATES",
+        "{bad_dst}"
+    );
+}
+
+#[test]
 fn unknown_tool_is_protocol_error() {
     let Some(mut c) = Client::start() else { return };
     init(&mut c);
