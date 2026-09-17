@@ -739,7 +739,7 @@ mod pointer_session {
 }
 
 // ---------------------------------------------------------------------------
-// Persistent virtual keyboard (zwlr_virtual_keyboard_v1).
+// Persistent virtual keyboard (zwp_virtual_keyboard_v1).
 //
 // Hyprland 0.56.2's Lua dispatchers (hl.dsp.send_key_state / send_shortcut)
 // return "ok" but deliver no key events to Wayland-native clients — verified
@@ -994,7 +994,7 @@ mod keyboard_session {
         pub fn apply(&mut self, ops: &[KeyOp]) -> Result<Delivery, String> {
             // Resolve every name first so an unknown key/modifier rejects the
             // whole batch before any event is emitted.
-            enum Ev {
+            enum ResolvedOp {
                 Key { code: u32, pressed: bool },
                 Mods { mask: u32 },
             }
@@ -1005,7 +1005,7 @@ mod keyboard_session {
                         let Some(code) = self.keycode_for(name) else {
                             return Err(format!("unknown key name {name:?}"));
                         };
-                        events.push(Ev::Key {
+                        events.push(ResolvedOp::Key {
                             code,
                             pressed: *pressed,
                         });
@@ -1018,14 +1018,14 @@ mod keyboard_session {
                             };
                             mask |= bit;
                         }
-                        events.push(Ev::Mods { mask });
+                        events.push(ResolvedOp::Mods { mask });
                     }
                 }
             }
             let mut sent = false;
             for ev in events {
                 match ev {
-                    Ev::Key { code, pressed } => {
+                    ResolvedOp::Key { code, pressed } => {
                         let t = self.tick();
                         self.keyboard.key(
                             t,
@@ -1043,7 +1043,7 @@ mod keyboard_session {
                             self.held.remove(&code);
                         }
                     }
-                    Ev::Mods { mask } => {
+                    ResolvedOp::Mods { mask } => {
                         self.mods_depressed = mask;
                         self.keyboard.modifiers(mask, 0, 0, 0);
                     }

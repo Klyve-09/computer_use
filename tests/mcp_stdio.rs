@@ -227,6 +227,31 @@ fn key_and_text_rejections() {
         "{bad_mod}"
     );
 
+    // Invalid paste mode must reject BEFORE the clipboard is replaced.
+    if Command::new("wl-copy")
+        .arg("sentinel")
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        let bad_paste = c.call_tool(
+            "computer_action",
+            json!({"observation_id": oid, "action": {"kind": "type_text", "text": "CLOBBER", "paste": "bogus"}}),
+        );
+        let code = bad_paste["result"]["structuredContent"]["error"]["code"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            code == "INVALID_PASTE" || code == "FOCUS_MISMATCH",
+            "{bad_paste}"
+        );
+        let clip = Command::new("wl-paste").output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&clip.stdout).trim_end(),
+            "sentinel",
+            "clipboard must be untouched"
+        );
+    }
+
     // Key name that resolves to no keycode -> rejected before any event;
     // the observation is consumed (post-action observe supersedes it only on
     // success, so reuse a fresh one if needed).

@@ -396,7 +396,19 @@ impl ComputerUse {
                 }
             }
             ActionKind::TypeText { text, paste } => {
-                type_text(&self.keyboard, text, paste.as_deref()).await
+                // Validate the paste mode before touching the clipboard: an
+                // invalid value must be a rejection, not a clipboard clobber.
+                let mods: Vec<String> = match paste.as_deref().unwrap_or("ctrl_v") {
+                    "ctrl_v" => vec!["ctrl".into()],
+                    "ctrl_shift_v" => vec!["ctrl".into(), "shift".into()],
+                    _ => {
+                        return action_err(
+                            "INVALID_PASTE",
+                            "paste must be \"ctrl_v\" or \"ctrl_shift_v\"",
+                        );
+                    }
+                };
+                type_text(&self.keyboard, text, mods).await
             }
             ActionKind::Click { .. } | ActionKind::Scroll { .. } => {
                 let Some(layout) = backend::layout_box(&snapshot) else {
@@ -592,14 +604,15 @@ async fn key_chord(
     mods: &[String],
     key: &str,
 ) -> Result<backend::Delivery, String> {
+    // Caller validated every modifier name already.
+    let names: Vec<String> = mods
+        .iter()
+        .map(|m| modifier(m).unwrap().to_string())
+        .collect();
+    let has_mods = !names.is_empty();
     let mut ops: Vec<KeyOp> = Vec::new();
-    if !mods.is_empty() {
-        ops.push(KeyOp::Mods {
-            names: mods
-                .iter()
-                .map(|m| modifier(m).unwrap().to_string())
-                .collect(),
-        });
+    if has_mods {
+        ops.push(KeyOp::Mods { names });
     }
     ops.push(KeyOp::Key {
         name: key.to_string(),
@@ -609,7 +622,7 @@ async fn key_chord(
         name: key.to_string(),
         pressed: false,
     });
-    if !mods.is_empty() {
+    if has_mods {
         ops.push(KeyOp::Mods { names: vec![] });
     }
     let kb = keyboard.clone();
@@ -620,17 +633,11 @@ async fn key_chord(
 
 /// Clipboard-set then paste shortcut. Clipboard replacement alone is a side
 /// effect: a paste failure after it is `partial`, never `none`.
-async fn type_text(keyboard: &Arc<Keyboard>, text: &str, paste: Option<&str>) -> backend::Delivery {
+async fn type_text(keyboard: &Arc<Keyboard>, text: &str, mods: Vec<String>) -> backend::Delivery {
     if backend::clipboard_set(text).await.is_err() {
         return backend::Delivery::None;
     }
-    let mods: &[&str] = match paste.unwrap_or("ctrl_v") {
-        "ctrl_v" => &["ctrl"],
-        "ctrl_shift_v" => &["ctrl", "shift"],
-        _ => return backend::Delivery::Partial, // clipboard already replaced
-    };
-    let owned: Vec<String> = mods.iter().map(|s| s.to_string()).collect();
-    match key_chord(keyboard, &owned, "v").await {
+    match key_chord(keyboard, &mods, "v").await {
         Ok(d) => d,
         Err(_) => backend::Delivery::Partial, // 'v'/ctrl/shift always resolve
     }
