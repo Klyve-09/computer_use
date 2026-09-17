@@ -405,7 +405,8 @@ impl ComputerUse {
                         format!("unknown modifier {bad:?}; use ctrl/shift/alt/super"),
                     );
                 }
-                match key_chord(&self.keyboard, mods, key).await {
+                let guard = Some((self.state.generation.clone(), obs.generation));
+                match key_chord(&self.keyboard, mods, key, guard).await {
                     Ok(d) => d,
                     Err(msg) => return action_err("INVALID_KEY", msg),
                 }
@@ -423,7 +424,8 @@ impl ComputerUse {
                         );
                     }
                 };
-                type_text(&self.keyboard, text, mods).await
+                let guard = Some((self.state.generation.clone(), obs.generation));
+                type_text(&self.keyboard, text, mods, guard).await
             }
             ActionKind::Click { .. } | ActionKind::Scroll { .. } | ActionKind::Drag { .. } => {
                 let Some(layout) = backend::layout_box(&snapshot) else {
@@ -572,7 +574,8 @@ impl ComputerUse {
                     _ => unreachable!(),
                 }
                 let pointer = self.pointer.clone();
-                tokio::task::spawn_blocking(move || pointer.apply(ops))
+                let guard = Some((self.state.generation.clone(), obs.generation));
+                tokio::task::spawn_blocking(move || pointer.apply(ops, guard))
                     .await
                     .unwrap_or(backend::Delivery::Unknown)
             }
@@ -694,6 +697,7 @@ async fn key_chord(
     keyboard: &Arc<Keyboard>,
     mods: &[String],
     key: &str,
+    guard: Option<(Arc<AtomicU64>, u64)>,
 ) -> Result<backend::Delivery, String> {
     // Caller validated every modifier name already.
     let names: Vec<String> = mods
@@ -717,18 +721,23 @@ async fn key_chord(
         ops.push(KeyOp::Mods { names: vec![] });
     }
     let kb = keyboard.clone();
-    tokio::task::spawn_blocking(move || kb.apply(ops))
+    tokio::task::spawn_blocking(move || kb.apply(ops, guard))
         .await
         .unwrap_or(Ok(backend::Delivery::Unknown))
 }
 
 /// Clipboard-set then paste shortcut. Clipboard replacement alone is a side
 /// effect: a paste failure after it is `partial`, never `none`.
-async fn type_text(keyboard: &Arc<Keyboard>, text: &str, mods: Vec<String>) -> backend::Delivery {
+async fn type_text(
+    keyboard: &Arc<Keyboard>,
+    text: &str,
+    mods: Vec<String>,
+    guard: Option<(Arc<AtomicU64>, u64)>,
+) -> backend::Delivery {
     if backend::clipboard_set(text).await.is_err() {
         return backend::Delivery::None;
     }
-    match key_chord(keyboard, &mods, "v").await {
+    match key_chord(keyboard, &mods, "v", guard).await {
         Ok(d) => d,
         Err(_) => backend::Delivery::Partial, // 'v'/ctrl/shift always resolve
     }

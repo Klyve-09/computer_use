@@ -1,6 +1,6 @@
 # 05: Recover from display changes and interrupted actions
 
-Status: Approved on 2026-09-17; ready-for-agent.
+Status: Implemented and verified on 2026-09-17.
 
 ## Parent
 

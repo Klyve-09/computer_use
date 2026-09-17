@@ -46,3 +46,24 @@ No production code, Rust toolchain installation, Codex configuration edit, or Gi
 - [Backend research with sources](backend-research.md)
 - [MCP research with sources](mcp-research.md)
 - Prototype branch `prototype/computer-use-coordinates`, commit `5c853b613b9bebbdb4743ad4cf4bb4471561dc14`; worktree `/home/hyh/computer_use-prototypes/coordinates`.
+
+## Implementation verification log (tickets #2–#6)
+
+Environment: Hyprland 0.56.2, eDP-1 2560x1440 @ scale 1.25, fcitx5 present, Rust stable via rustup, Codex CLI 0.153.3, server `target/release/computer-use-mcp`.
+
+### #6 runtime recovery
+
+Commands were driven over the real stdio MCP boundary (python JSON-RPC harness) and real `codex exec` sessions.
+
+- **Live config change / change-and-restore**: `hyprctl eval 'hl.monitor({output="eDP-1", ..., scale=1.0})'` then restore to 1.25. `wl_output` listener bumped the generation on both halves; pre-change observation IDs reject `STALE_OBSERVATION`; fresh `computer_observe` restores usability. Also verified under `hyprctl reload` (generation bump with identical fingerprint).
+- **Mid-drag abort**: drag eDP-1 → HEADLESS-4 with a scale flip ~300 ms in returned `outcome: partial`, `effect: partial`, `display_changed_during_action: true`, `do_not_replay: true`, plus a fresh destination observation. The generation guard stops remaining interpolated moves and releases the held button before returning.
+- **Event socket loss/reconnect**: `COMPUTER_USE_EVENT_SOCKET=/tmp/fake-ev.sock` pointed the watcher at a controlled Unix socket; closing the peer produced EOF → generation bump (12→13) → `STALE_OBSERVATION` on the old ID → automatic reconnect within the 1 s backoff → fresh observation actionable, click `completed`.
+- **Server restart**: new process epoch invalidates every pre-restart ID (`unknown or expired`).
+- **Codex recover-and-continue** (`codex exec`, model gpt-6-astra, danger-full-access): observe eDP-1 → `sleep 15` (scale flipped externally during the sleep) → click on the stale ID rejected `STALE_OBSERVATION` → re-observe → same click `outcome: ok`, `effect: completed`. 53,396 tokens.
+- **Serialization**: `action_lock` serializes all actions; pointer/keyboard sessions are single-threaded behind command channels.
+- **Cancellation/timeout/shutdown**: every op batch ends with explicit releases; transport failure triggers best-effort release of held buttons/keys/mods; delivery waits are bounded at 10 s. Forced termination (`SIGKILL`) and compositor failure cannot guarantee cleanup — documented in README "Recovery and operator notes".
+- **No replay after failed capture**: post-action capture failure returns `partial` + `SCREENSHOT_FAILED_AFTER_ACTION`/`OBSERVATION_FAILED_AFTER_INPUT` + `do_not_replay`; nothing auto-retries.
+
+Evidence classes: physical panel (eDP-1) for observe/click/scroll/key/paste/mid-drag-abort/socket-loss/restart; virtual headless outputs (HEADLESS-*) for cross-output drag and mixed-scale mapping; unit/stdio tests for boundary rejections. No arithmetic-only substitutes were counted as input evidence.
+
+Automated: `cargo test` → 13 unit + 6 stdio tests, all green.

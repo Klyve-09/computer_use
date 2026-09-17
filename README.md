@@ -156,7 +156,69 @@ Live evidence (Hyprland 0.56.2, scale 1.25, fcitx5 IME present):
   with a fresh destination observation; the button was released.
   Headless-output evidence is labelled as such — a virtual output shares the
   compositor code path but is not a physical panel.
+- Recovery (issue #6): mid-drag `hl.monitor` scale change now aborts the
+  remaining ops — verified `effect: partial` + `display_changed_during_action`
+  (the button was released before the run continued). Event-socket loss was
+  exercised via `COMPUTER_USE_EVENT_SOCKET` against a controlled peer: EOF
+  bumped the generation, the watcher reconnected, pre-change observation IDs
+  rejected `STALE_OBSERVATION`, fresh observations restored usability. Server
+  restart verified: pre-restart IDs reject (`unknown or expired`). Real Codex
+  recover-and-continue verified: observe → external scale flip → stale
+  rejection → re-observe → click `completed`.
 
 Not verified: bare letter keys under a composing IME are transformed (by
 design — same as a physical keyboard); non-US physical layouts are
 untested (keysyms resolve against the uploaded default keymap).
+
+## Recovery and operator notes
+
+Runtime display changes are handled by invalidation, not atomicity: there
+is **no** guarantee that a config change can't interleave with delivered
+input. The defenses are:
+
+- Every action batch checks the display generation between ops. A change
+  mid-sequence stops the remaining intended input, releases held
+  buttons/keys/modifiers first, and reports `effect: partial` +
+  `display_changed_during_action` + `do_not_replay` with a fresh
+  observation where possible.
+- All actions serialize on one lock — pointer and keyboard state can never
+  interleave across requests.
+- A failed post-action capture never triggers a replay; the result is
+  `partial`/`do_not_replay` and says to `computer_observe` again.
+- `effect: none` means nothing was sent (safe to retry with a fresh
+  observation); `partial`/`unknown` mean input may have landed — assess the
+  screen first.
+
+Cleanup guarantees: every op batch ends with explicit releases, and
+transport failures trigger a best-effort release of whatever is held.
+`SIGKILL`, compositor crashes, or Wayland disconnects cannot guarantee
+cleanup — the virtual devices are destroyed with the connection, which
+releases held state in practice but is not contractual.
+
+Operator recovery procedure when something looks stuck:
+
+1. `hyprctl cursorpos` / click a neutral window — check the pointer isn't
+   held (a stuck grab makes the desktop feel frozen). Killing the server
+   process destroys the virtual devices and releases state.
+2. `wl-paste -l` / `wl-paste` — check whether `type_text` replaced the
+   clipboard; re-copy whatever was there before if needed.
+3. `fcitx5-remote` — `2` means a composing IME is active; `fcitx5-remote -c`
+   deactivates if bare `key` letters are being transformed.
+4. If observations report `actionable: false`, check
+   `events_healthy`/`wayland_events_healthy` on `computer_monitors`; the
+   watchers reconnect automatically, so a persistent `false` means the
+   Hyprland IPC socket or Wayland display is unreachable — verify
+   `HYPRLAND_INSTANCE_SIGNATURE`/`XDG_RUNTIME_DIR` or just restart the
+   server (old observation IDs are invalidated by the new epoch anyway).
+
+Diagnostics:
+
+- Dependency versions: `hyprctl version`, `grim --version`,
+  `wl-copy --version` (wl-clipboard), `pkg-config --modversion xkbcommon`.
+- `COMPUTER_USE_EVENT_SOCKET=<path>` redirects the IPC watcher at a chosen
+  Unix socket — used to exercise disconnect/reconnect against a controlled
+  peer without disturbing the live compositor.
+- Timeouts: `hyprctl` 5 s, `grim` 10 s, pointer/keyboard delivery 10 s,
+  pointer `Wait` ops bounded per-op; reconnect backoff 1 s.
+- The server never writes to stdout except MCP messages; diagnostics go to
+  stderr.

@@ -160,8 +160,10 @@ pub async fn clipboard_set(text: &str) -> Result<(), BackendError> {
     let mut child =
         session_env(Command::new("wl-copy").args(["--type", "text/plain;charset=utf-8"]))
             .stdin(std::process::Stdio::piped())
+            // wl-copy forks a daemon to serve the selection; it must not
+            // inherit our stdio or it keeps the MCP pipes open forever.
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
@@ -295,6 +297,11 @@ pub fn watch_events(
 }
 
 fn event_socket_path() -> Option<std::path::PathBuf> {
+    // Diagnostic/test seam: point the watcher at a controlled socket to
+    // exercise disconnect/reconnect without touching the real compositor.
+    if let Some(p) = std::env::var_os("COMPUTER_USE_EVENT_SOCKET") {
+        return Some(std::path::PathBuf::from(p));
+    }
     let his = hyprland_signature()?;
     let runtime = runtime_dir()?;
     Some(runtime.join("hypr").join(his).join(".socket2.sock"))
@@ -511,7 +518,13 @@ pub enum Delivery {
 }
 
 pub struct Pointer {
-    tx: std::sync::mpsc::Sender<(Vec<PointerOp>, std::sync::mpsc::Sender<Delivery>)>,
+    tx: std::sync::mpsc::Sender<
+        (
+            Vec<PointerOp>,
+            Option<(Arc<AtomicU64>, u64)>,
+            std::sync::mpsc::Sender<Delivery>,
+        ),
+    >,
 }
 
 impl Pointer {
@@ -519,17 +532,20 @@ impl Pointer {
     /// request and is retried after failures; the pointer object persists so
     /// button state survives across calls (required for drags later).
     pub fn start() -> Self {
-        let (tx, rx) =
-            std::sync::mpsc::channel::<(Vec<PointerOp>, std::sync::mpsc::Sender<Delivery>)>();
+        let (tx, rx) = std::sync::mpsc::channel::<(
+            Vec<PointerOp>,
+            Option<(Arc<AtomicU64>, u64)>,
+            std::sync::mpsc::Sender<Delivery>,
+        )>();
         std::thread::spawn(move || {
             let mut session: Option<pointer_session::Session> = None;
-            for (ops, reply) in rx {
+            for (ops, guard, reply) in rx {
                 if session.is_none() {
                     session = pointer_session::Session::connect().ok();
                 }
                 let result = match session.as_mut() {
                     None => Delivery::None,
-                    Some(s) => s.apply(&ops),
+                    Some(s) => s.apply(&ops, &guard),
                 };
                 let _ = reply.send(result);
                 if session.as_ref().is_some_and(|s| s.broken) {
@@ -541,9 +557,12 @@ impl Pointer {
     }
 
     /// Blocks until the op list is delivered or fails. Call from spawn_blocking.
-    pub fn apply(&self, ops: Vec<PointerOp>) -> Delivery {
+    /// `guard` is (generation counter, expected value): when the generation
+    /// has moved on (display change mid-action), remaining ops are skipped and
+    /// held inputs released before returning Partial.
+    pub fn apply(&self, ops: Vec<PointerOp>, guard: Option<(Arc<AtomicU64>, u64)>) -> Delivery {
         let (reply, rx) = std::sync::mpsc::channel();
-        if self.tx.send((ops, reply)).is_err() {
+        if self.tx.send((ops, guard, reply)).is_err() {
             return Delivery::None;
         }
         // Bound the wait: a wedged compositor must not hang every later action.
@@ -554,6 +573,8 @@ impl Pointer {
 
 mod pointer_session {
     use super::{Delivery, PointerOp};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use wayland_client::globals::{GlobalListContents, registry_queue_init};
     use wayland_client::protocol::{wl_output, wl_pointer, wl_registry};
     use wayland_client::{Connection, Dispatch, QueueHandle};
@@ -669,9 +690,25 @@ mod pointer_session {
             let _ = self.conn.flush();
         }
 
-        pub fn apply(&mut self, ops: &[PointerOp]) -> Delivery {
+        pub fn apply(
+            &mut self,
+            ops: &[PointerOp],
+            guard: &Option<(Arc<AtomicU64>, u64)>,
+        ) -> Delivery {
             let mut sent = false;
             for op in ops {
+                // A display change mid-sequence invalidates every further
+                // intended coordinate: stop here and release what is held.
+                if let Some((g, expected)) = guard {
+                    if g.load(Ordering::SeqCst) != *expected {
+                        self.release_all();
+                        return if sent {
+                            Delivery::Partial
+                        } else {
+                            Delivery::None
+                        };
+                    }
+                }
                 let t = self.tick();
                 match *op {
                     PointerOp::Move {
@@ -778,6 +815,7 @@ pub enum KeyOp {
 pub struct Keyboard {
     tx: std::sync::mpsc::Sender<(
         Vec<KeyOp>,
+        Option<(Arc<AtomicU64>, u64)>,
         std::sync::mpsc::Sender<Result<Delivery, String>>,
     )>,
 }
@@ -786,17 +824,18 @@ impl Keyboard {
     pub fn start() -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<(
             Vec<KeyOp>,
+            Option<(Arc<AtomicU64>, u64)>,
             std::sync::mpsc::Sender<Result<Delivery, String>>,
         )>();
         std::thread::spawn(move || {
             let mut session: Option<keyboard_session::Session> = None;
-            for (ops, reply) in rx {
+            for (ops, guard, reply) in rx {
                 if session.is_none() {
                     session = keyboard_session::Session::connect().ok();
                 }
                 let result = match session.as_mut() {
                     None => Ok(Delivery::None),
-                    Some(s) => s.apply(&ops),
+                    Some(s) => s.apply(&ops, &guard),
                 };
                 let _ = reply.send(result);
                 if session.as_ref().is_some_and(|s| s.broken) {
@@ -807,10 +846,16 @@ impl Keyboard {
         Self { tx }
     }
 
-    /// Blocks until the key list is delivered or fails. Call from spawn_blocking.
-    pub fn apply(&self, ops: Vec<KeyOp>) -> Result<Delivery, String> {
+    /// Blocks until the key list is delivered or fails. Call from
+    /// spawn_blocking. `guard` aborts remaining ops (with releases) when the
+    /// display generation has moved on mid-sequence.
+    pub fn apply(
+        &self,
+        ops: Vec<KeyOp>,
+        guard: Option<(Arc<AtomicU64>, u64)>,
+    ) -> Result<Delivery, String> {
         let (reply, rx) = std::sync::mpsc::channel();
-        if self.tx.send((ops, reply)).is_err() {
+        if self.tx.send((ops, guard, reply)).is_err() {
             return Ok(Delivery::None);
         }
         rx.recv_timeout(Duration::from_secs(10))
@@ -821,6 +866,8 @@ impl Keyboard {
 mod keyboard_session {
     use super::{Delivery, KeyOp};
     use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::io::Write;
     use std::os::fd::AsFd;
     use wayland_client::globals::{GlobalListContents, registry_queue_init};
@@ -1005,7 +1052,11 @@ mod keyboard_session {
             let _ = self.conn.flush();
         }
 
-        pub fn apply(&mut self, ops: &[KeyOp]) -> Result<Delivery, String> {
+        pub fn apply(
+            &mut self,
+            ops: &[KeyOp],
+            guard: &Option<(Arc<AtomicU64>, u64)>,
+        ) -> Result<Delivery, String> {
             // Resolve every name first so an unknown key/modifier rejects the
             // whole batch before any event is emitted.
             enum ResolvedOp {
@@ -1038,6 +1089,17 @@ mod keyboard_session {
             }
             let mut sent = false;
             for ev in events {
+                // Display change mid-sequence: stop and release what is held.
+                if let Some((g, expected)) = guard {
+                    if g.load(Ordering::SeqCst) != *expected {
+                        self.release_all();
+                        return Ok(if sent {
+                            Delivery::Partial
+                        } else {
+                            Delivery::None
+                        });
+                    }
+                }
                 match ev {
                     ResolvedOp::Key { code, pressed } => {
                         let t = self.tick();
