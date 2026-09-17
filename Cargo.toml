@@ -16,3 +16,6 @@ wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
 xkbcommon = "0.9"
 memfd = "0.6"
+
+[dev-dependencies]
+socket2 = "0.6"

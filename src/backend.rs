@@ -52,6 +52,8 @@ pub enum BackendError {
     Failed(String),
     Timeout(&'static str),
     TooLarge(usize),
+    /// Checked before a side effect ran: nothing was attempted.
+    Cancelled,
 }
 
 impl std::fmt::Display for BackendError {
@@ -61,6 +63,7 @@ impl std::fmt::Display for BackendError {
             Self::Failed(msg) => write!(f, "{msg}"),
             Self::Timeout(what) => write!(f, "{what} timed out"),
             Self::TooLarge(n) => write!(f, "capture exceeded {n} byte limit"),
+            Self::Cancelled => write!(f, "cancelled"),
         }
     }
 }
@@ -156,7 +159,13 @@ pub async fn focused_monitor() -> Result<Option<String>, BackendError> {
 }
 
 /// Replace the clipboard with the exact UTF-8 text (stdin, never shell).
-pub async fn clipboard_set(text: &str) -> Result<(), BackendError> {
+/// Cancellation is checked before spawn (returns `Cancelled`, no side
+/// effect) and raced against the subprocess: a mid-run cancel kills wl-copy
+/// and reports `Failed`, since the clipboard may already be replaced.
+pub async fn clipboard_set(text: &str, abort: &Abort) -> Result<(), BackendError> {
+    if abort.stopped() {
+        return Err(BackendError::Cancelled);
+    }
     let mut child =
         session_env(Command::new("wl-copy").args(["--type", "text/plain;charset=utf-8"]))
             .stdin(std::process::Stdio::piped())
@@ -178,13 +187,22 @@ pub async fn clipboard_set(text: &str) -> Result<(), BackendError> {
         stdin.write_all(text.as_bytes()).await?;
         stdin.shutdown().await
     };
-    let (wres, cres) = tokio::join!(write, tokio::time::timeout(HYPRCTL_TIMEOUT, child.wait()));
-    wres.map_err(|e| BackendError::Failed(format!("wl-copy stdin: {e}")))?;
-    match cres {
-        Err(_) => Err(BackendError::Timeout("wl-copy")),
-        Ok(Err(e)) => Err(BackendError::Failed(format!("wl-copy: {e}"))),
-        Ok(Ok(s)) if !s.success() => Err(BackendError::Failed(format!("wl-copy exited {s}"))),
-        Ok(Ok(_)) => Ok(()),
+    let (write_result, child_result) = tokio::join!(write, async {
+        tokio::select! {
+            r = tokio::time::timeout(HYPRCTL_TIMEOUT, child.wait()) => Some(r),
+            _ = abort.wait_cancelled() => {
+                let _ = child.kill().await;
+                None
+            }
+        }
+    });
+    write_result.map_err(|e| BackendError::Failed(format!("wl-copy stdin: {e}")))?;
+    match child_result {
+        None => Err(BackendError::Failed("wl-copy cancelled".into())),
+        Some(Err(_)) => Err(BackendError::Timeout("wl-copy")),
+        Some(Ok(Err(e))) => Err(BackendError::Failed(format!("wl-copy: {e}"))),
+        Some(Ok(Ok(s))) if !s.success() => Err(BackendError::Failed(format!("wl-copy exited {s}"))),
+        Some(Ok(Ok(_))) => Ok(()),
     }
 }
 
@@ -540,6 +558,8 @@ pub struct Abort {
     expected: u64,
     cancelled: AtomicBool,
     kick: Mutex<Option<std::os::unix::net::UnixStream>>,
+    /// Wakes async waiters (e.g. a subprocess racing the caller's cancel).
+    wake: tokio::sync::Notify,
 }
 
 impl Abort {
@@ -549,14 +569,47 @@ impl Abort {
             expected,
             cancelled: AtomicBool::new(false),
             kick: Mutex::new(None),
+            wake: tokio::sync::Notify::new(),
         })
     }
 
     /// True when remaining input must stop: caller cancelled or the display
     /// configuration moved on mid-action.
-    fn stopped(&self) -> bool {
+    pub fn stopped(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
             || self.generation.load(Ordering::SeqCst) != self.expected
+    }
+
+    /// Only the caller-cancel flag: distinguishes "client cancelled" from a
+    /// mid-action display change for result reporting.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Worker-side: aim the kick fd at the live connection so a caller-side
+    /// timeout/cancel can interrupt the current request's roundtrip.
+    fn set_kick(&self, stream: &std::os::unix::net::UnixStream) {
+        *self.kick.lock().unwrap() = stream.try_clone().ok();
+    }
+
+    /// Resolves once `stopped()` is true. Cancellation wakes immediately;
+    /// a generation move is observed on the next wake cycle or poll — async
+    /// users should also check `stopped()` before each side effect.
+    pub async fn wait_cancelled(&self) {
+        loop {
+            if self.stopped() {
+                return;
+            }
+            let n = self.wake.notified();
+            tokio::pin!(n);
+            // Register the waiter before re-checking so a cancel racing in
+            // between the checks is not missed.
+            n.as_mut().enable();
+            if self.stopped() {
+                return;
+            }
+            n.await;
+        }
     }
 
     /// Caller-side cancel: set the flag and interrupt any blocking Wayland
@@ -564,8 +617,47 @@ impl Abort {
     /// releases held input, drops the poisoned session, and acknowledges.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
+        self.wake.notify_waiters();
         if let Some(kick) = self.kick.lock().unwrap().take() {
             let _ = kick.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
+/// `UnixStream::connect` is uninterruptible: a listener with a full accept
+/// backlog wedges it before any kick fd exists to shut down. Run the
+/// blocking connect on a helper thread and bound the wait — on abort or
+/// deadline the late result is dropped unopened, so a delayed connection
+/// can never deliver input behind a later action.
+/// ponytail: a wedged connect parks one helper thread per attempt until the
+/// kernel accept queue drains; the alternative (nonblocking connect + poll)
+/// needs a socket crate for no observable difference here.
+const INPUT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn connect_input_socket(
+    path: &std::path::Path,
+    abort: &Abort,
+) -> Result<std::os::unix::net::UnixStream, Box<dyn std::error::Error>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        let _ = tx.send(std::os::unix::net::UnixStream::connect(path));
+    });
+    let deadline = std::time::Instant::now() + INPUT_CONNECT_TIMEOUT;
+    loop {
+        if abort.stopped() {
+            return Err("input socket connect cancelled".into());
+        }
+        match rx.recv_timeout(Duration::from_millis(25)) {
+            Ok(r) => return r.map_err(|e| e.into()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err("input socket connect timed out".into());
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("input socket connect thread died".into());
+            }
         }
     }
 }
@@ -595,9 +687,7 @@ impl Pointer {
                     session = pointer_session::Session::connect(&abort).ok();
                 }
                 if let Some(s) = &session {
-                    // Keep the kick fd aimed at the live connection so a
-                    // caller-side timeout/cancel can interrupt this request.
-                    *abort.kick.lock().unwrap() = s.kick.try_clone().ok();
+                    abort.set_kick(&s.kick);
                 }
                 let result = match session.as_mut() {
                     None => Delivery::None,
@@ -719,11 +809,13 @@ mod pointer_session {
     impl Session {
         pub fn connect(abort: &Abort) -> Result<Self, Box<dyn std::error::Error>> {
             let path = super::input_socket_path().ok_or("no wayland session")?;
-            let stream = std::os::unix::net::UnixStream::connect(path)?;
+            // Deadline/abort-bound connect: a full accept backlog cannot
+            // wedge the worker past the caller's reply timeout.
+            let stream = super::connect_input_socket(&path, abort)?;
             // Publish the kick fd before the first roundtrip so a caller-side
             // timeout/cancel can interrupt connection setup too.
             let kick = stream.try_clone()?;
-            *abort.kick.lock().unwrap() = kick.try_clone().ok();
+            abort.set_kick(&kick);
             let backend = wayland_client::backend::Backend::connect(stream)?;
             let conn = Connection::from_backend(backend);
             let (globals, mut queue) = registry_queue_init::<State>(&conn)?;
@@ -927,7 +1019,7 @@ impl Keyboard {
                     session = keyboard_session::Session::connect(&abort).ok();
                 }
                 if let Some(s) = &session {
-                    *abort.kick.lock().unwrap() = s.kick.try_clone().ok();
+                    abort.set_kick(&s.kick);
                 }
                 let result = match session.as_mut() {
                     None => Ok(Delivery::None),
@@ -1046,9 +1138,9 @@ mod keyboard_session {
     impl Session {
         pub fn connect(abort: &Abort) -> Result<Self, Box<dyn std::error::Error>> {
             let path = super::input_socket_path().ok_or("no wayland session")?;
-            let stream = std::os::unix::net::UnixStream::connect(path)?;
+            let stream = super::connect_input_socket(&path, abort)?;
             let kick = stream.try_clone()?;
-            *abort.kick.lock().unwrap() = kick.try_clone().ok();
+            abort.set_kick(&kick);
             let backend = wayland_client::backend::Backend::connect(stream)?;
             let conn = Connection::from_backend(backend);
             let (globals, mut queue) = registry_queue_init::<State>(&conn)?;

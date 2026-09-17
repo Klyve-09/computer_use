@@ -258,6 +258,7 @@ fn backend_error(e: BackendError) -> Result<CallToolResult, McpError> {
         BackendError::Missing(_) => "MISSING_DEPENDENCY",
         BackendError::Timeout(_) => "BACKEND_TIMEOUT",
         BackendError::TooLarge(_) => "CAPTURE_TOO_LARGE",
+        BackendError::Cancelled => "CANCELLED",
         BackendError::Failed(_) => "BACKEND_FAILED",
     };
     err_result(code, e.to_string())
@@ -353,7 +354,21 @@ impl ComputerUse {
         context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
         Parameters(p): Parameters<ActionParams>,
     ) -> Result<CallToolResult, McpError> {
-        let _serial = self.action_lock.lock().await;
+        // Queued wait is cancellation-aware: a request cancelled behind
+        // another action must never reach a side effect once it gets in.
+        // The is_cancelled re-check covers a cancel racing in just as the
+        // lock is granted.
+        const QUEUED_CANCELLED: &str =
+            "request cancelled while queued behind another action; no input was attempted";
+        let _serial = tokio::select! {
+            guard = self.action_lock.lock() => guard,
+            _ = context.ct.cancelled() => {
+                return action_err("CANCELLED", QUEUED_CANCELLED);
+            }
+        };
+        if context.ct.is_cancelled() {
+            return action_err("CANCELLED", QUEUED_CANCELLED);
+        }
 
         let snapshot = match backend::monitors().await.map(backend::selectable) {
             Ok(m) => m,
@@ -393,7 +408,7 @@ impl ComputerUse {
         // operation: flag + socket shutdown interrupt wedged roundtrips too.
         let _cancel_watch = AbortOnDrop(tokio::spawn({
             let abort = abort.clone();
-            let ct = context.ct;
+            let ct = context.ct.clone();
             async move {
                 ct.cancelled().await;
                 abort.cancel();
@@ -614,6 +629,19 @@ impl ComputerUse {
         let action_json = serde_json::to_value(&p.action).unwrap_or_default();
 
         if delivery == backend::Delivery::None {
+            if abort.is_cancelled() {
+                return action_err(
+                    "CANCELLED",
+                    "request cancelled before any input was sent; no side effect occurred",
+                );
+            }
+            // Stopped by a display change, not by cancel or a dead backend.
+            if self.state.generation.load(Ordering::SeqCst) != obs.generation {
+                return action_err(
+                    "STALE_OBSERVATION",
+                    "display configuration changed; call computer_observe for a fresh observation_id",
+                );
+            }
             return action_err(
                 "INPUT_BACKEND_UNAVAILABLE",
                 "input backend unavailable or action rejected before any input was sent",
@@ -753,12 +781,17 @@ async fn type_text(
     mods: Vec<String>,
     abort: Arc<backend::Abort>,
 ) -> backend::Delivery {
-    match backend::clipboard_set(text).await {
+    // A cancelled request must not reach the clipboard: checked before
+    // wl-copy spawns, and the subprocess is killed if cancel lands mid-run.
+    match backend::clipboard_set(text, &abort).await {
         Ok(()) => {}
         // wl-copy never spawned: clipboard untouched, nothing happened.
-        Err(backend::BackendError::Missing(_)) => return backend::Delivery::None,
-        // wl-copy ran but failed (bad exit, timeout, broken stdin): the
-        // clipboard may already have been replaced, so report unknown.
+        Err(backend::BackendError::Missing(_) | backend::BackendError::Cancelled) => {
+            return backend::Delivery::None;
+        }
+        // wl-copy ran but failed (bad exit, timeout, broken stdin, killed on
+        // cancel): the clipboard may already have been replaced, so report
+        // unknown.
         Err(_) => return backend::Delivery::Unknown,
     }
     match key_chord(keyboard, &mods, "v", abort).await {

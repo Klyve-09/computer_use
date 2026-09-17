@@ -85,6 +85,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "socket2",
  "tokio",
  "uuid",
  "wayland-client",

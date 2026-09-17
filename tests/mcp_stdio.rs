@@ -1,13 +1,15 @@
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 
 /// Drives the real server over stdio JSON-RPC, the public seam Codex uses.
 /// Requires a live Hyprland session (hyprctl/grim); skipped otherwise.
 struct Client {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    rx: std::sync::mpsc::Receiver<Value>,
+    /// Responses for ids other than the awaited one, in arrival order.
+    pending: Vec<Value>,
     next_id: u64,
 }
 
@@ -30,27 +32,69 @@ impl Client {
         }
         let mut child = cmd.spawn().unwrap();
         let stdin = child.stdin.take().unwrap();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            while stdout.read_line(&mut line).unwrap_or(0) > 0 {
+                if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                    if tx.send(v).is_err() {
+                        return;
+                    }
+                }
+                line.clear();
+            }
+        });
         Some(Self {
             child,
             stdin,
-            stdout,
+            rx,
+            pending: Vec::new(),
             next_id: 0,
         })
     }
 
-    fn request(&mut self, method: &str, params: Value) -> Value {
+    /// Next response for `id`, buffering anything else; None on timeout.
+    fn await_id(&mut self, id: u64, timeout: std::time::Duration) -> Option<Value> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(i) = self
+                .pending
+                .iter()
+                .position(|v| v.get("id").and_then(Value::as_u64) == Some(id))
+            {
+                return Some(self.pending.remove(i));
+            }
+            let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
+            match self.rx.recv_timeout(remaining) {
+                Ok(v) => self.pending.push(v),
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// Send a request and return its id without waiting for the response.
+    fn send(&mut self, method: &str, params: Value) -> u64 {
         self.next_id += 1;
         let msg = json!({"jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params});
         writeln!(self.stdin, "{msg}").unwrap();
-        loop {
-            let mut line = String::new();
-            self.stdout.read_line(&mut line).unwrap();
-            let v: Value = serde_json::from_str(&line).unwrap();
-            if v.get("id").and_then(Value::as_u64) == Some(self.next_id) {
-                return v;
-            }
-        }
+        self.next_id
+    }
+
+    fn send_tool(&mut self, name: &str, arguments: Value) -> u64 {
+        self.send("tools/call", json!({"name": name, "arguments": arguments}))
+    }
+
+    /// MCP notifications/cancelled for an in-flight or queued request.
+    fn cancel(&mut self, id: u64) {
+        let msg = json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": id, "reason": "test cancellation"}});
+        writeln!(self.stdin, "{msg}").unwrap();
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.send(method, params);
+        self.await_id(id, std::time::Duration::from_secs(30))
+            .expect("timed out waiting for response")
     }
 
     fn notify(&mut self, method: &str) {
@@ -194,7 +238,15 @@ fn action_rejects_stale_and_invalid_without_input() {
 
 #[test]
 fn key_and_text_rejections() {
-    let Some(mut c) = Client::start() else { return };
+    let rig = event_rig();
+    // Deterministic focus precondition: the fixture reports focus on the
+    // test monitor so the assertions below are never skipped by
+    // FOCUS_MISMATCH.
+    let (mon, mon_id) = first_monitor();
+    focus_fixture(&rig, mon_id);
+    let Some(mut c) = Client::start_with(&rig_env(&rig)) else {
+        return;
+    };
     init(&mut c);
 
     // Stale/unknown observation -> rejected before any input.
@@ -213,7 +265,7 @@ fn key_and_text_rejections() {
         assert_eq!(r["result"]["structuredContent"]["effect"], "none");
     }
 
-    let obs = c.call_tool("computer_observe", json!({"monitor": "eDP-1"}));
+    let obs = c.call_tool("computer_observe", json!({"monitor": mon}));
     let oid = obs["result"]["structuredContent"]["observation_id"]
         .as_str()
         .unwrap()
@@ -224,12 +276,8 @@ fn key_and_text_rejections() {
         "computer_action",
         json!({"observation_id": oid, "action": {"kind": "key", "key": "a", "mods": ["banana"]}}),
     );
-    let code = bad_mod["result"]["structuredContent"]["error"]["code"]
-        .as_str()
-        .unwrap_or("");
-    // Focus may not be on eDP-1 in a test run; either rejection is acceptable.
-    assert!(
-        code == "INVALID_MODIFIER" || code == "FOCUS_MISMATCH",
+    assert_eq!(
+        bad_mod["result"]["structuredContent"]["error"]["code"], "INVALID_MODIFIER",
         "{bad_mod}"
     );
 
@@ -247,11 +295,8 @@ fn key_and_text_rejections() {
             "computer_action",
             json!({"observation_id": oid, "action": {"kind": "type_text", "text": "CLOBBER", "paste": "bogus"}}),
         );
-        let code = bad_paste["result"]["structuredContent"]["error"]["code"]
-            .as_str()
-            .unwrap_or("");
-        assert!(
-            code == "INVALID_PASTE" || code == "FOCUS_MISMATCH",
+        assert_eq!(
+            bad_paste["result"]["structuredContent"]["error"]["code"], "INVALID_PASTE",
             "{bad_paste}"
         );
         let clip = Command::new("wl-paste").output().unwrap();
@@ -269,12 +314,8 @@ fn key_and_text_rejections() {
         "computer_action",
         json!({"observation_id": oid, "action": {"kind": "key", "key": "NoSuchKeysym42"}}),
     );
-    let code = bad_key["result"]["structuredContent"]["error"]["code"]
-        .as_str()
-        .unwrap_or("");
-    // Focus may not be on eDP-1 in a test run; either rejection is acceptable.
-    assert!(
-        code == "INVALID_KEY" || code == "FOCUS_MISMATCH",
+    assert_eq!(
+        bad_key["result"]["structuredContent"]["error"]["code"], "INVALID_KEY",
         "{bad_key}"
     );
 }
@@ -408,11 +449,63 @@ fn rig_env(rig: &Rig) -> Vec<(String, String)> {
     ]
 }
 
+/// Absolute path of a binary on the real PATH (skipping rig dirs).
+fn real_bin(name: &str) -> std::path::PathBuf {
+    let rigs = std::env::temp_dir();
+    for dir in std::env::split_paths(&std::env::var_os("PATH").unwrap()) {
+        let p = dir.join(name);
+        if p.is_file() && !p.starts_with(&rigs) {
+            return p;
+        }
+    }
+    panic!("{name} not found on PATH");
+}
+
+/// First selectable monitor's (name, compositor id) from the real session.
+fn first_monitor() -> (String, i64) {
+    let out = Command::new(real_bin("hyprctl"))
+        .args(["-j", "monitors"])
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let m = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| !m["disabled"].as_bool().unwrap_or(false))
+        .expect("no selectable monitor in this session");
+    (
+        m["name"].as_str().unwrap().to_string(),
+        m["id"].as_i64().unwrap(),
+    )
+}
+
+/// PATH-shadowed hyprctl that reports the focused window on `monitor_id`
+/// and delegates everything else to the real binary. Key/type actions
+/// require focus on the observed monitor; this fixture makes that
+/// precondition deterministic so regressions always run their assertions
+/// instead of silently passing on FOCUS_MISMATCH.
+fn focus_fixture(rig: &Rig, monitor_id: i64) {
+    let real = real_bin("hyprctl");
+    script(
+        rig,
+        "hyprctl",
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = \"-j\" ] && [ \"$2\" = \"activewindow\" ]; then printf '{{\"monitor\": {monitor_id}}}\\n'; else exec {} \"$@\"; fi\n",
+            real.display()
+        ),
+    );
+}
+
 /// A config event arriving mid-post-action-capture must never produce an
 /// `outcome: ok` result with a fresh actionable observation (review P1).
 #[test]
 fn config_change_during_post_action_capture_is_partial() {
     let rig = event_rig();
+    // Focus precondition is made deterministic (fixture reports focus on the
+    // test monitor); without it this test must fail loudly, not pass.
+    let (mon, mon_id) = first_monitor();
+    focus_fixture(&rig, mon_id);
     // Wrap real grim: after capturing, trip the event trigger and wait so
     // the event lands inside the server's capture bracket.
     script(
@@ -428,7 +521,7 @@ fn config_change_during_post_action_capture_is_partial() {
     };
     init(&mut c);
     std::thread::sleep(std::time::Duration::from_millis(300));
-    let obs = c.call_tool("computer_observe", json!({"monitor": "eDP-1"}));
+    let obs = c.call_tool("computer_observe", json!({"monitor": mon}));
     let oid = obs["result"]["structuredContent"]["observation_id"]
         .as_str()
         .unwrap()
@@ -440,10 +533,6 @@ fn config_change_during_post_action_capture_is_partial() {
         json!({"observation_id": oid, "action": {"kind": "key", "key": "Shift_L"}}),
     );
     let sc = &r["result"]["structuredContent"];
-    if sc["error"]["code"] == "FOCUS_MISMATCH" {
-        eprintln!("focus not on eDP-1; skipping assertions");
-        return;
-    }
     assert_eq!(r["result"]["isError"], json!(true), "{r}");
     assert_eq!(sc["outcome"], "partial", "{r}");
     assert_eq!(sc["display_changed_during_action"], json!(true), "{r}");
@@ -455,6 +544,8 @@ fn config_change_during_post_action_capture_is_partial() {
 #[test]
 fn clipboard_replaced_then_aborted_paste_reports_partial() {
     let rig = event_rig();
+    let (mon, mon_id) = first_monitor();
+    focus_fixture(&rig, mon_id);
     // Simulate a successful clipboard replacement into a marker file; the
     // user's real clipboard is untouched.
     script(
@@ -470,7 +561,7 @@ fn clipboard_replaced_then_aborted_paste_reports_partial() {
     };
     init(&mut c);
     std::thread::sleep(std::time::Duration::from_millis(300));
-    let obs = c.call_tool("computer_observe", json!({"monitor": "eDP-1"}));
+    let obs = c.call_tool("computer_observe", json!({"monitor": mon}));
     let oid = obs["result"]["structuredContent"]["observation_id"]
         .as_str()
         .unwrap()
@@ -481,10 +572,6 @@ fn clipboard_replaced_then_aborted_paste_reports_partial() {
         json!({"observation_id": oid, "action": {"kind": "type_text", "text": "regression-clip"}}),
     );
     let sc = &r["result"]["structuredContent"];
-    if sc["error"]["code"] == "FOCUS_MISMATCH" {
-        eprintln!("focus not on eDP-1; skipping assertions");
-        return;
-    }
     assert_eq!(
         std::fs::read_to_string(rig.dir.join("clipboard")).unwrap(),
         "regression-clip"
@@ -534,10 +621,165 @@ fn wedged_input_connection_times_out_and_recovers() {
     assert!(start.elapsed() < std::time::Duration::from_secs(20), "{r}");
     let sc = &r["result"]["structuredContent"];
     assert_eq!(r["result"]["isError"], json!(true), "{r}");
-    assert_eq!(sc["error"]["code"], "INPUT_BACKEND_UNAVAILABLE", "{r}");
+    // Wedged before any event: either the reply-timeout cancel aborted it
+    // (CANCELLED) or the backend never came up (INPUT_BACKEND_UNAVAILABLE).
+    let code = sc["error"]["code"].as_str().unwrap_or("");
+    assert!(
+        code == "CANCELLED" || code == "INPUT_BACKEND_UNAVAILABLE",
+        "{r}"
+    );
+    assert_eq!(sc["effect"], "none", "{r}");
 
     // The server is still responsive afterwards: the action lock was held
     // through teardown, so no delayed input can overlap later requests.
     let mon = c.call_tool("computer_monitors", json!({}));
     assert_ne!(mon["result"]["isError"], json!(true), "{mon}");
+}
+
+/// A request cancelled while queued behind a wedged action must run no side
+/// effects at all once admitted — no clipboard write, no paste (review P1).
+#[test]
+fn cancelled_queued_action_runs_no_side_effects() {
+    let rig = event_rig();
+    let (mon, mon_id) = first_monitor();
+    focus_fixture(&rig, mon_id);
+    // If the cancelled request executes, this marker file appears. The real
+    // clipboard is untouched.
+    script(
+        &rig,
+        "wl-copy",
+        &format!(
+            "#!/usr/bin/python3\nimport pathlib,sys\npathlib.Path(\"{d}/clipboard-marker\").write_bytes(sys.stdin.buffer.read())\n",
+            d = rig.dir.display()
+        ),
+    );
+    // Silent input socket: accepts, never answers, so the first action holds
+    // the action lock stuck in a Wayland roundtrip.
+    let sock = rig.dir.join("input.sock");
+    let silent = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        while let Ok((peer, _)) = silent.accept() {
+            let _ = accepted_tx.send(());
+            held.push(peer);
+        }
+    });
+    let mut env = rig_env(&rig);
+    env.push((
+        "COMPUTER_USE_INPUT_SOCKET".into(),
+        sock.display().to_string(),
+    ));
+    let Some(mut c) = Client::start_with(&env) else {
+        return;
+    };
+    init(&mut c);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let obs = c.call_tool("computer_observe", json!({"monitor": mon}));
+    let oid = obs["result"]["structuredContent"]["observation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Action A wedges mid-roundtrip and holds the serialized action lock.
+    let a = c.send_tool(
+        "computer_action",
+        json!({"observation_id": oid, "action": {"kind": "click", "x": 10, "y": 10, "button": "left"}}),
+    );
+    accepted_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("input session never connected");
+
+    // Action B queues behind it, then is cancelled before it can run.
+    let b = c.send_tool(
+        "computer_action",
+        json!({"observation_id": oid, "action": {"kind": "type_text", "text": "CANCELLED_REQUEST_EXECUTED"}}),
+    );
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    c.cancel(b);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    c.cancel(a);
+
+    // rmcp drops the response for a cancelled request, so neither A nor B
+    // produces one. A follow-up request proves the cancelled wedged action
+    // released the action lock instead of hanging the worker.
+    let done = c.call_tool(
+        "computer_action",
+        json!({"observation_id": "invalid", "action": {"kind": "click", "x": 10, "y": 10, "button": "left"}}),
+    );
+    assert_eq!(
+        done["result"]["structuredContent"]["error"]["code"], "STALE_OBSERVATION",
+        "{done}"
+    );
+    // The regression assertion: once A was interrupted and B's queued slot
+    // ran, the cancelled request must have produced no side effect.
+    assert!(
+        !rig.dir.join("clipboard-marker").exists(),
+        "cancelled queued request replaced the clipboard"
+    );
+}
+
+/// A listener with a full accept backlog wedges `UnixStream::connect`
+/// before any kick fd exists; connection setup must still meet a deadline
+/// and a following request must not be stuck behind it (review P1).
+#[test]
+fn full_input_backlog_connect_is_deadline_bound() {
+    let rig = event_rig();
+    let sock = rig.dir.join("input.sock");
+    // listen(0): one queued connection fills the backlog, so the server's
+    // blocking connect() parks in the kernel before any session exists.
+    let listener =
+        socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+    listener
+        .bind(&socket2::SockAddr::unix(&sock).unwrap())
+        .unwrap();
+    listener.listen(0).unwrap();
+    let _filler = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    let mut env = rig_env(&rig);
+    env.push((
+        "COMPUTER_USE_INPUT_SOCKET".into(),
+        sock.display().to_string(),
+    ));
+    let Some(mut c) = Client::start_with(&env) else {
+        return;
+    };
+    init(&mut c);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let (mon, _) = first_monitor();
+    let obs = c.call_tool("computer_observe", json!({"monitor": mon}));
+    let oid = obs["result"]["structuredContent"]["observation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let start = std::time::Instant::now();
+    let r = c.call_tool(
+        "computer_action",
+        json!({"observation_id": oid, "action": {"kind": "click", "x": 10, "y": 10, "button": "left"}}),
+    );
+    // Connect is bounded (~5s deadline) — the wedged worker must not hold
+    // the action lock past the reply timeout.
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(9),
+        "wedged connect did not meet its deadline: {r}"
+    );
+    let sc = &r["result"]["structuredContent"];
+    assert_eq!(r["result"]["isError"], json!(true), "{r}");
+    assert_eq!(sc["error"]["code"], "INPUT_BACKEND_UNAVAILABLE", "{r}");
+    assert_eq!(sc["effect"], "none", "{r}");
+
+    // A following request answers promptly: no delayed input is in flight.
+    let start = std::time::Instant::now();
+    let bad = c.call_tool(
+        "computer_action",
+        json!({"observation_id": "invalid", "action": {"kind": "click", "x": 10, "y": 10, "button": "left"}}),
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "following request stuck behind the wedged connect: {bad}"
+    );
+    assert_eq!(
+        bad["result"]["structuredContent"]["error"]["code"], "STALE_OBSERVATION",
+        "{bad}"
+    );
 }
