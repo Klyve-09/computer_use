@@ -1,8 +1,8 @@
 use serde::Deserialize;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -413,6 +413,17 @@ fn wayland_socket_path() -> Option<std::path::PathBuf> {
     Some(runtime_dir()?.join(wayland_display()?))
 }
 
+/// Socket the virtual input devices connect to. Diagnostic/test seam:
+/// COMPUTER_USE_INPUT_SOCKET points input sessions at a controlled endpoint
+/// (e.g. one that accepts then stays silent) to exercise wedged-connection
+/// timeout and cancellation without touching the real compositor.
+fn input_socket_path() -> Option<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os("COMPUTER_USE_INPUT_SOCKET") {
+        return Some(std::path::PathBuf::from(p));
+    }
+    wayland_socket_path()
+}
+
 // ---------------------------------------------------------------------------
 // Persistent virtual pointer (zwlr_virtual_pointer_v1) + coordinate mapping.
 // ---------------------------------------------------------------------------
@@ -517,19 +528,54 @@ pub enum Delivery {
     Unknown,
 }
 
-/// Mid-action abort signal: (live generation counter, value the action was
-/// validated against). Sessions check it between ops; a mismatch stops the
-/// remaining intended input, releases held state, and reports Partial.
-pub type Guard = Option<(Arc<AtomicU64>, u64)>;
+/// Mid-action abort signal shared by the caller and the worker thread:
+/// the live generation counter plus the value the action was validated
+/// against, a cancel flag (reply timeout or MCP request cancel), and
+/// a `kick` socket — a dup of the worker's current Wayland connection that
+/// the caller can shutdown() to interrupt a wedged blocking roundtrip.
+/// Sessions check `stopped` between ops; stopping skips the remaining
+/// intended input, releases held state, and reports Partial/None.
+pub struct Abort {
+    generation: Arc<AtomicU64>,
+    expected: u64,
+    cancelled: AtomicBool,
+    kick: Mutex<Option<std::os::unix::net::UnixStream>>,
+}
+
+impl Abort {
+    pub fn new(generation: Arc<AtomicU64>, expected: u64) -> Arc<Self> {
+        Arc::new(Self {
+            generation,
+            expected,
+            cancelled: AtomicBool::new(false),
+            kick: Mutex::new(None),
+        })
+    }
+
+    /// True when remaining input must stop: caller cancelled or the display
+    /// configuration moved on mid-action.
+    fn stopped(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+            || self.generation.load(Ordering::SeqCst) != self.expected
+    }
+
+    /// Caller-side cancel: set the flag and interrupt any blocking Wayland
+    /// roundtrip by shutting down the worker's connection. The worker then
+    /// releases held input, drops the poisoned session, and acknowledges.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        if let Some(kick) = self.kick.lock().unwrap().take() {
+            let _ = kick.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
 
 pub struct Pointer {
-    tx: std::sync::mpsc::Sender<
-        (
-            Vec<PointerOp>,
-            Guard,
-            std::sync::mpsc::Sender<Delivery>,
-        ),
-    >,
+    tx: std::sync::mpsc::Sender<(
+        Vec<PointerOp>,
+        Arc<Abort>,
+        std::sync::mpsc::Sender<Delivery>,
+    )>,
 }
 
 impl Pointer {
@@ -539,21 +585,30 @@ impl Pointer {
     pub fn start() -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<(
             Vec<PointerOp>,
-            Guard,
+            Arc<Abort>,
             std::sync::mpsc::Sender<Delivery>,
         )>();
         std::thread::spawn(move || {
             let mut session: Option<pointer_session::Session> = None;
-            for (ops, guard, reply) in rx {
-                if session.is_none() {
-                    session = pointer_session::Session::connect().ok();
+            for (ops, abort, reply) in rx {
+                if session.is_none() && !abort.stopped() {
+                    session = pointer_session::Session::connect(&abort).ok();
+                }
+                if let Some(s) = &session {
+                    // Keep the kick fd aimed at the live connection so a
+                    // caller-side timeout/cancel can interrupt this request.
+                    *abort.kick.lock().unwrap() = s.kick.try_clone().ok();
                 }
                 let result = match session.as_mut() {
                     None => Delivery::None,
-                    Some(s) => s.apply(&ops, &guard),
+                    Some(s) => s.apply(&ops, &abort),
                 };
                 let _ = reply.send(result);
-                if session.as_ref().is_some_and(|s| s.broken) {
+                // A cancelled request or a broken connection drops the
+                // session; Drop releases any still-held buttons.
+                if abort.cancelled.load(Ordering::SeqCst)
+                    || session.as_ref().is_some_and(|s| s.broken)
+                {
                     session = None;
                 }
             }
@@ -562,23 +617,31 @@ impl Pointer {
     }
 
     /// Blocks until the op list is delivered or fails. Call from spawn_blocking.
-    /// `guard` is (generation counter, expected value): when the generation
-    /// has moved on (display change mid-action), remaining ops are skipped and
-    /// held inputs released before returning Partial.
-    pub fn apply(&self, ops: Vec<PointerOp>, guard: Guard) -> Delivery {
+    /// `abort` stops remaining ops (with releases) when the display generation
+    /// has moved on or the caller cancels.
+    /// On reply timeout the call cancels the operation — set flag plus a
+    /// shutdown() of the worker socket — and then holds for the teardown
+    /// acknowledgment: no later action may overlap a worker that could still
+    /// be mid-sequence. If the worker never acknowledges, this call (and the
+    /// serialized action lock behind it) stays blocked rather than risk
+    /// delayed input racing a subsequent action.
+    pub fn apply(&self, ops: Vec<PointerOp>, abort: Arc<Abort>) -> Delivery {
         let (reply, rx) = std::sync::mpsc::channel();
-        if self.tx.send((ops, guard, reply)).is_err() {
+        if self.tx.send((ops, abort.clone(), reply)).is_err() {
             return Delivery::None;
         }
-        // Bound the wait: a wedged compositor must not hang every later action.
-        rx.recv_timeout(Duration::from_secs(10))
-            .unwrap_or(Delivery::Unknown)
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(d) => d,
+            Err(_) => {
+                abort.cancel();
+                rx.recv().unwrap_or(Delivery::Unknown)
+            }
+        }
     }
 }
 
 mod pointer_session {
-    use super::{Delivery, Guard, PointerOp};
-    use std::sync::atomic::Ordering;
+    use super::{Abort, Delivery, PointerOp};
     use wayland_client::globals::{GlobalListContents, registry_queue_init};
     use wayland_client::protocol::{wl_output, wl_pointer, wl_registry};
     use wayland_client::{Connection, Dispatch, QueueHandle};
@@ -589,6 +652,9 @@ mod pointer_session {
         conn: Connection,
         pointer: ZwlrVirtualPointerV1,
         held: std::collections::HashSet<u32>,
+        /// Second fd onto the session socket; shutdown() wakes a wedged
+        /// roundtrip. Shared with the caller via `Abort::kick`.
+        pub kick: std::os::unix::net::UnixStream,
         time_ms: u32,
         pub broken: bool,
     }
@@ -651,9 +717,13 @@ mod pointer_session {
     }
 
     impl Session {
-        pub fn connect() -> Result<Self, Box<dyn std::error::Error>> {
-            let path = super::wayland_socket_path().ok_or("no wayland session")?;
+        pub fn connect(abort: &Abort) -> Result<Self, Box<dyn std::error::Error>> {
+            let path = super::input_socket_path().ok_or("no wayland session")?;
             let stream = std::os::unix::net::UnixStream::connect(path)?;
+            // Publish the kick fd before the first roundtrip so a caller-side
+            // timeout/cancel can interrupt connection setup too.
+            let kick = stream.try_clone()?;
+            *abort.kick.lock().unwrap() = kick.try_clone().ok();
             let backend = wayland_client::backend::Backend::connect(stream)?;
             let conn = Connection::from_backend(backend);
             let (globals, mut queue) = registry_queue_init::<State>(&conn)?;
@@ -683,6 +753,7 @@ mod pointer_session {
                 conn,
                 pointer,
                 held: Default::default(),
+                kick,
                 time_ms: 0,
                 broken: false,
             })
@@ -704,24 +775,19 @@ mod pointer_session {
             let _ = self.conn.flush();
         }
 
-        pub fn apply(
-            &mut self,
-            ops: &[PointerOp],
-            guard: &Guard,
-        ) -> Delivery {
+        pub fn apply(&mut self, ops: &[PointerOp], abort: &Abort) -> Delivery {
             let mut sent = false;
             for op in ops {
-                // A display change mid-sequence invalidates every further
-                // intended coordinate: stop here and release what is held.
-                if let Some((g, expected)) = guard {
-                    if g.load(Ordering::SeqCst) != *expected {
-                        self.release_all();
-                        return if sent {
-                            Delivery::Partial
-                        } else {
-                            Delivery::None
-                        };
-                    }
+                // A display change or caller cancel mid-sequence invalidates
+                // every further intended coordinate: stop here and release
+                // what is held.
+                if abort.stopped() {
+                    self.release_all();
+                    return if sent {
+                        Delivery::Partial
+                    } else {
+                        Delivery::None
+                    };
                 }
                 let t = self.tick();
                 match *op {
@@ -766,11 +832,24 @@ mod pointer_session {
                         // Flush before sleeping so earlier events are already
                         // on the wire; caps keep one action bounded. Advance
                         // the event clock by the slept time so toolkits see
-                        // real gesture timing, not a jump.
+                        // real gesture timing, not a jump. Sleep in chunks so
+                        // an abort mid-hold still stops the gesture promptly.
                         let _ = self.conn.flush();
-                        let ms = ms.min(2000);
-                        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
-                        self.time_ms = self.time_ms.wrapping_add(ms);
+                        let mut remaining = ms.min(2000);
+                        while remaining > 0 {
+                            if abort.stopped() {
+                                self.release_all();
+                                return if sent {
+                                    Delivery::Partial
+                                } else {
+                                    Delivery::None
+                                };
+                            }
+                            let step = remaining.min(20);
+                            std::thread::sleep(std::time::Duration::from_millis(step as u64));
+                            remaining -= step;
+                        }
+                        self.time_ms = self.time_ms.wrapping_add(ms.min(2000));
                     }
                     PointerOp::Frame => self.pointer.frame(),
                 }
@@ -829,7 +908,7 @@ pub enum KeyOp {
 pub struct Keyboard {
     tx: std::sync::mpsc::Sender<(
         Vec<KeyOp>,
-        Guard,
+        Arc<Abort>,
         std::sync::mpsc::Sender<Result<Delivery, String>>,
     )>,
 }
@@ -838,21 +917,26 @@ impl Keyboard {
     pub fn start() -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<(
             Vec<KeyOp>,
-            Guard,
+            Arc<Abort>,
             std::sync::mpsc::Sender<Result<Delivery, String>>,
         )>();
         std::thread::spawn(move || {
             let mut session: Option<keyboard_session::Session> = None;
-            for (ops, guard, reply) in rx {
-                if session.is_none() {
-                    session = keyboard_session::Session::connect().ok();
+            for (ops, abort, reply) in rx {
+                if session.is_none() && !abort.stopped() {
+                    session = keyboard_session::Session::connect(&abort).ok();
+                }
+                if let Some(s) = &session {
+                    *abort.kick.lock().unwrap() = s.kick.try_clone().ok();
                 }
                 let result = match session.as_mut() {
                     None => Ok(Delivery::None),
-                    Some(s) => s.apply(&ops, &guard),
+                    Some(s) => s.apply(&ops, &abort),
                 };
                 let _ = reply.send(result);
-                if session.as_ref().is_some_and(|s| s.broken) {
+                if abort.cancelled.load(Ordering::SeqCst)
+                    || session.as_ref().is_some_and(|s| s.broken)
+                {
                     session = None;
                 }
             }
@@ -861,26 +945,29 @@ impl Keyboard {
     }
 
     /// Blocks until the key list is delivered or fails. Call from
-    /// spawn_blocking. `guard` aborts remaining ops (with releases) when the
-    /// display generation has moved on mid-sequence.
-    pub fn apply(
-        &self,
-        ops: Vec<KeyOp>,
-        guard: Guard,
-    ) -> Result<Delivery, String> {
+    /// spawn_blocking. `abort` aborts remaining ops (with releases) when the
+    /// display generation has moved on mid-sequence or the caller cancels.
+    /// Reply timeout cancels the operation and holds for the worker's
+    /// teardown acknowledgment before returning Unknown, so no delayed input
+    /// can overlap a subsequent action.
+    pub fn apply(&self, ops: Vec<KeyOp>, abort: Arc<Abort>) -> Result<Delivery, String> {
         let (reply, rx) = std::sync::mpsc::channel();
-        if self.tx.send((ops, guard, reply)).is_err() {
+        if self.tx.send((ops, abort.clone(), reply)).is_err() {
             return Ok(Delivery::None);
         }
-        rx.recv_timeout(Duration::from_secs(10))
-            .unwrap_or(Ok(Delivery::Unknown))
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(d) => d,
+            Err(_) => {
+                abort.cancel();
+                rx.recv().unwrap_or(Ok(Delivery::Unknown))
+            }
+        }
     }
 }
 
 mod keyboard_session {
-    use super::{Delivery, Guard, KeyOp};
+    use super::{Abort, Delivery, KeyOp};
     use std::collections::HashSet;
-    use std::sync::atomic::Ordering;
     use std::io::Write;
     use std::os::fd::AsFd;
     use wayland_client::globals::{GlobalListContents, registry_queue_init};
@@ -895,6 +982,7 @@ mod keyboard_session {
         keyboard: ZwpVirtualKeyboardV1,
         keymap: xkb::Keymap,
         held: HashSet<u32>,
+        pub kick: std::os::unix::net::UnixStream,
         mods_depressed: u32,
         time_ms: u32,
         pub broken: bool,
@@ -956,9 +1044,11 @@ mod keyboard_session {
     }
 
     impl Session {
-        pub fn connect() -> Result<Self, Box<dyn std::error::Error>> {
-            let path = super::wayland_socket_path().ok_or("no wayland session")?;
+        pub fn connect(abort: &Abort) -> Result<Self, Box<dyn std::error::Error>> {
+            let path = super::input_socket_path().ok_or("no wayland session")?;
             let stream = std::os::unix::net::UnixStream::connect(path)?;
+            let kick = stream.try_clone()?;
+            *abort.kick.lock().unwrap() = kick.try_clone().ok();
             let backend = wayland_client::backend::Backend::connect(stream)?;
             let conn = Connection::from_backend(backend);
             let (globals, mut queue) = registry_queue_init::<State>(&conn)?;
@@ -1020,6 +1110,7 @@ mod keyboard_session {
                 keyboard,
                 keymap,
                 held: Default::default(),
+                kick,
                 mods_depressed: 0,
                 time_ms: 0,
                 broken: false,
@@ -1073,11 +1164,7 @@ mod keyboard_session {
             let _ = self.conn.flush();
         }
 
-        pub fn apply(
-            &mut self,
-            ops: &[KeyOp],
-            guard: &Guard,
-        ) -> Result<Delivery, String> {
+        pub fn apply(&mut self, ops: &[KeyOp], abort: &Abort) -> Result<Delivery, String> {
             // Resolve every name first so an unknown key/modifier rejects the
             // whole batch before any event is emitted.
             enum ResolvedOp {
@@ -1110,16 +1197,15 @@ mod keyboard_session {
             }
             let mut sent = false;
             for ev in events {
-                // Display change mid-sequence: stop and release what is held.
-                if let Some((g, expected)) = guard {
-                    if g.load(Ordering::SeqCst) != *expected {
-                        self.release_all();
-                        return Ok(if sent {
-                            Delivery::Partial
-                        } else {
-                            Delivery::None
-                        });
-                    }
+                // Display change or caller cancel mid-sequence: stop and
+                // release what is held.
+                if abort.stopped() {
+                    self.release_all();
+                    return Ok(if sent {
+                        Delivery::Partial
+                    } else {
+                        Delivery::None
+                    });
                 }
                 match ev {
                     ResolvedOp::Key { code, pressed } => {

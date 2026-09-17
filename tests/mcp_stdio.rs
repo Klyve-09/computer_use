@@ -13,16 +13,22 @@ struct Client {
 
 impl Client {
     fn start() -> Option<Self> {
+        Self::start_with(&[])
+    }
+
+    fn start_with(extra_env: &[(String, String)]) -> Option<Self> {
         if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none() {
             eprintln!("skipping: not in a Hyprland session");
             return None;
         }
-        let mut child = Command::new(env!("CARGO_BIN_EXE_computer-use-mcp"))
-            .stdin(Stdio::piped())
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_computer-use-mcp"));
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         Some(Self {
@@ -319,4 +325,219 @@ fn unknown_tool_is_protocol_error() {
     init(&mut c);
     let r = c.call_tool("computer_nope", json!({}));
     assert!(r.get("error").is_some());
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for the 2026-09-17 review findings. They drive the real
+// stdio server against controlled seams: a fake Hyprland event socket
+// (COMPUTER_USE_EVENT_SOCKET), PATH-shadowed wl-copy/grim wrappers, and a
+// silent input socket (COMPUTER_USE_INPUT_SOCKET). No user clipboard is
+// touched; real input sent is a harmless Shift_L press at most.
+// ---------------------------------------------------------------------------
+
+/// Controlled Hyprland event socket. The pump forwards `configreloaded`
+/// whenever a `trigger` file appears in the rig dir; accepted peers are kept
+/// alive so the server's watcher stays connected and healthy.
+struct Rig {
+    dir: std::path::PathBuf,
+    // Held only to keep accepted watcher connections open for the test.
+    _keep: std::sync::Arc<std::sync::Mutex<Vec<std::os::unix::net::UnixStream>>>,
+}
+
+fn event_rig() -> Rig {
+    let dir = std::env::temp_dir().join(format!(
+        "cut-rig-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(dir.join("events.sock")).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<std::os::unix::net::UnixStream>();
+    std::thread::spawn(move || {
+        while let Ok((peer, _)) = listener.accept() {
+            let _ = tx.send(peer);
+        }
+    });
+    let keep = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let pump_dir = dir.clone();
+    let pump_keep = keep.clone();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            while let Ok(peer) = rx.try_recv() {
+                pump_keep.lock().unwrap().push(peer);
+            }
+            let trigger = pump_dir.join("trigger");
+            if !trigger.exists() {
+                continue;
+            }
+            std::fs::remove_file(&trigger).ok();
+            use std::io::Write;
+            for peer in pump_keep.lock().unwrap().iter_mut() {
+                let _ = peer.write_all(b"configreloaded>>\n");
+            }
+        }
+    });
+    Rig { dir, _keep: keep }
+}
+
+impl Drop for Rig {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn script(rig: &Rig, name: &str, body: &str) {
+    let path = rig.dir.join(name);
+    std::fs::write(&path, body).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn rig_env(rig: &Rig) -> Vec<(String, String)> {
+    let path = format!("{}:{}", rig.dir.display(), std::env::var("PATH").unwrap());
+    vec![
+        (
+            "COMPUTER_USE_EVENT_SOCKET".into(),
+            rig.dir.join("events.sock").display().to_string(),
+        ),
+        ("PATH".into(), path),
+    ]
+}
+
+/// A config event arriving mid-post-action-capture must never produce an
+/// `outcome: ok` result with a fresh actionable observation (review P1).
+#[test]
+fn config_change_during_post_action_capture_is_partial() {
+    let rig = event_rig();
+    // Wrap real grim: after capturing, trip the event trigger and wait so
+    // the event lands inside the server's capture bracket.
+    script(
+        &rig,
+        "grim",
+        &format!(
+            "#!/bin/sh\n/usr/bin/grim \"$@\"\nif [ -e \"{d}/race_capture\" ]; then touch \"{d}/trigger\"; sleep 0.3; fi\n",
+            d = rig.dir.display()
+        ),
+    );
+    let Some(mut c) = Client::start_with(&rig_env(&rig)) else {
+        return;
+    };
+    init(&mut c);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let obs = c.call_tool("computer_observe", json!({"monitor": "eDP-1"}));
+    let oid = obs["result"]["structuredContent"]["observation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    std::fs::write(rig.dir.join("race_capture"), "").unwrap();
+    let r = c.call_tool(
+        "computer_action",
+        json!({"observation_id": oid, "action": {"kind": "key", "key": "Shift_L"}}),
+    );
+    let sc = &r["result"]["structuredContent"];
+    if sc["error"]["code"] == "FOCUS_MISMATCH" {
+        eprintln!("focus not on eDP-1; skipping assertions");
+        return;
+    }
+    assert_eq!(r["result"]["isError"], json!(true), "{r}");
+    assert_eq!(sc["outcome"], "partial", "{r}");
+    assert_eq!(sc["display_changed_during_action"], json!(true), "{r}");
+    assert_eq!(sc["do_not_replay"], json!(true), "{r}");
+}
+
+/// Clipboard replaced but paste aborted before any key event: effect must
+/// report a side effect (partial), never `none` (review P1).
+#[test]
+fn clipboard_replaced_then_aborted_paste_reports_partial() {
+    let rig = event_rig();
+    // Simulate a successful clipboard replacement into a marker file; the
+    // user's real clipboard is untouched.
+    script(
+        &rig,
+        "wl-copy",
+        &format!(
+            "#!/usr/bin/python3\nimport pathlib,sys,time\np=pathlib.Path(\"{d}\")\n(p/\"clipboard\").write_bytes(sys.stdin.buffer.read())\n(p/\"trigger\").touch()\ntime.sleep(0.25)\n",
+            d = rig.dir.display()
+        ),
+    );
+    let Some(mut c) = Client::start_with(&rig_env(&rig)) else {
+        return;
+    };
+    init(&mut c);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let obs = c.call_tool("computer_observe", json!({"monitor": "eDP-1"}));
+    let oid = obs["result"]["structuredContent"]["observation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let r = c.call_tool(
+        "computer_action",
+        json!({"observation_id": oid, "action": {"kind": "type_text", "text": "regression-clip"}}),
+    );
+    let sc = &r["result"]["structuredContent"];
+    if sc["error"]["code"] == "FOCUS_MISMATCH" {
+        eprintln!("focus not on eDP-1; skipping assertions");
+        return;
+    }
+    assert_eq!(
+        std::fs::read_to_string(rig.dir.join("clipboard")).unwrap(),
+        "regression-clip"
+    );
+    assert_eq!(r["result"]["isError"], json!(true), "{r}");
+    assert_eq!(sc["effect"], "partial", "{r}");
+    assert_eq!(sc["do_not_replay"], json!(true), "{r}");
+}
+
+/// A wedged input connection must be terminated by the reply timeout —
+/// response returns, no hang, no overlap with a following request
+/// (review P1). The silent socket never answers the Wayland roundtrip.
+#[test]
+fn wedged_input_connection_times_out_and_recovers() {
+    let rig = event_rig();
+    let sock = rig.dir.join("input.sock");
+    let silent = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    std::thread::spawn(move || {
+        let mut held = Vec::new(); // keep peers alive so connects stay wedged
+        while let Ok((peer, _)) = silent.accept() {
+            held.push(peer);
+        }
+    });
+    let mut env = rig_env(&rig);
+    env.push((
+        "COMPUTER_USE_INPUT_SOCKET".into(),
+        sock.display().to_string(),
+    ));
+    let Some(mut c) = Client::start_with(&env) else {
+        return;
+    };
+    init(&mut c);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let obs = c.call_tool("computer_observe", json!({"monitor": "eDP-1"}));
+    let oid = obs["result"]["structuredContent"]["observation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let start = std::time::Instant::now();
+    let r = c.call_tool(
+        "computer_action",
+        json!({"observation_id": oid, "action": {"kind": "click", "x": 10, "y": 10, "button": "left"}}),
+    );
+    // The worker's wedged connect is interrupted by timeout + socket
+    // shutdown; the reply must arrive, not hang. Allow generous headroom.
+    assert!(start.elapsed() < std::time::Duration::from_secs(20), "{r}");
+    let sc = &r["result"]["structuredContent"];
+    assert_eq!(r["result"]["isError"], json!(true), "{r}");
+    assert_eq!(sc["error"]["code"], "INPUT_BACKEND_UNAVAILABLE", "{r}");
+
+    // The server is still responsive afterwards: the action lock was held
+    // through teardown, so no delayed input can overlap later requests.
+    let mon = c.call_tool("computer_monitors", json!({}));
+    assert_ne!(mon["result"]["isError"], json!(true), "{mon}");
 }

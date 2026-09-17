@@ -350,6 +350,7 @@ impl ComputerUse {
     #[tool(name = "computer_action")]
     async fn computer_action(
         &self,
+        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
         Parameters(p): Parameters<ActionParams>,
     ) -> Result<CallToolResult, McpError> {
         let _serial = self.action_lock.lock().await;
@@ -377,6 +378,27 @@ impl ComputerUse {
         let Some(monitor) = snapshot.iter().find(|m| m.name == obs.monitor) else {
             return action_err("MONITOR_NOT_FOUND", "observation's monitor is gone");
         };
+        // One abort signal per action: stops on a mid-action display change
+        // (generation), on a worker reply timeout, or on MCP cancellation.
+        let abort = backend::Abort::new(self.state.generation.clone(), obs.generation);
+        // A display change racing in since validation must reject as stale,
+        // not surface as an input-backend failure from an instant abort.
+        if self.state.generation.load(Ordering::SeqCst) != obs.generation {
+            return action_err(
+                "STALE_OBSERVATION",
+                "display configuration changed; call computer_observe for a fresh observation_id",
+            );
+        }
+        // notifications/cancelled (or client disconnect) cancels the backend
+        // operation: flag + socket shutdown interrupt wedged roundtrips too.
+        let _cancel_watch = AbortOnDrop(tokio::spawn({
+            let abort = abort.clone();
+            let ct = context.ct;
+            async move {
+                ct.cancelled().await;
+                abort.cancel();
+            }
+        }));
         // Keyboard/text actions act on the focused window; it must live on
         // the observed monitor, else reject before any input.
         if matches!(
@@ -405,8 +427,7 @@ impl ComputerUse {
                         format!("unknown modifier {bad:?}; use ctrl/shift/alt/super"),
                     );
                 }
-                let guard = Some((self.state.generation.clone(), obs.generation));
-                match key_chord(&self.keyboard, mods, key, guard).await {
+                match key_chord(&self.keyboard, mods, key, abort.clone()).await {
                     Ok(d) => d,
                     Err(msg) => return action_err("INVALID_KEY", msg),
                 }
@@ -424,8 +445,7 @@ impl ComputerUse {
                         );
                     }
                 };
-                let guard = Some((self.state.generation.clone(), obs.generation));
-                type_text(&self.keyboard, text, mods, guard).await
+                type_text(&self.keyboard, text, mods, abort.clone()).await
             }
             ActionKind::Click { .. } | ActionKind::Scroll { .. } | ActionKind::Drag { .. } => {
                 let Some(layout) = backend::layout_box(&snapshot) else {
@@ -574,8 +594,8 @@ impl ComputerUse {
                     _ => unreachable!(),
                 }
                 let pointer = self.pointer.clone();
-                let guard = Some((self.state.generation.clone(), obs.generation));
-                tokio::task::spawn_blocking(move || pointer.apply(ops, guard))
+                let abort = abort.clone();
+                tokio::task::spawn_blocking(move || pointer.apply(ops, abort))
                     .await
                     .unwrap_or(backend::Delivery::Unknown)
             }
@@ -584,15 +604,6 @@ impl ComputerUse {
         // Bounded settling interval before post-action capture. This is an
         // observation time, not proof the application finished reacting.
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-
-        let post = backend::monitors().await.map(backend::selectable);
-        let raced = match &post {
-            Ok(m) => {
-                backend::fingerprint(m) != fp
-                    || self.state.generation.load(Ordering::SeqCst) != obs.generation
-            }
-            Err(_) => true,
-        };
 
         let effect = match delivery {
             backend::Delivery::Completed => "completed",
@@ -609,71 +620,79 @@ impl ComputerUse {
             );
         }
 
-        // Post-action observation on the target monitor (drag destination).
-        let post_obs = match &post {
-            Ok(ms) => match ms.iter().find(|m| m.name == post_monitor) {
-                Some(m) => match backend::capture(&m.name).await {
-                    Ok(png) => match backend::png_size(&png) {
-                        Some((w, h)) => Some((m.clone(), png, w, h)),
-                        None => None,
-                    },
-                    Err(_) => None,
-                },
-                None => None,
-            },
-            Err(_) => None,
+        // Post-action observation on the target monitor (drag destination),
+        // with the same capture bracketing as computer_observe: an image
+        // captured across a configuration change is never recorded as an
+        // actionable observation. `verified` is the (generation, fingerprint)
+        // pair of the freshest post-capture snapshot that survived a bracket.
+        let mut post_obs = None;
+        let mut verified = None;
+        for _ in 0..2 {
+            let Ok(pre) = backend::monitors().await.map(backend::selectable) else {
+                break;
+            };
+            let gen_pre = self.state.generation.load(Ordering::SeqCst);
+            let fp_pre = backend::fingerprint(&pre);
+            let Some(m) = pre.iter().find(|m| m.name == post_monitor) else {
+                break;
+            };
+            let Ok(png) = backend::capture(&m.name).await else {
+                break;
+            };
+            let Ok(post) = backend::monitors().await.map(backend::selectable) else {
+                break;
+            };
+            let gen_post = self.state.generation.load(Ordering::SeqCst);
+            let fp_post = backend::fingerprint(&post);
+            verified = Some((gen_post, fp_post));
+            if gen_pre != gen_post || fp_pre != fp_post {
+                continue;
+            }
+            if let Some((w, h)) = backend::png_size(&png) {
+                post_obs = Some((m.clone(), png, w, h));
+            }
+            break;
+        }
+        // Display configuration changed between validation and the verified
+        // post-action snapshot: even completed input gets a partial result.
+        let raced = match verified {
+            Some((g, f)) => g != obs.generation || f != fp,
+            None => true,
         };
 
-        if delivery != backend::Delivery::Completed || raced {
-            let mut v = serde_json::json!({
-                "outcome": "partial",
-                "effect": effect,
-                "action": action_json,
-                "do_not_replay": true,
-                "display_changed_during_action": raced,
-            });
-            match post_obs {
-                Some((m, png, w, h)) => {
-                    let generation = self.state.generation.load(Ordering::SeqCst);
-                    let fp_now = post
-                        .as_ref()
-                        .map(|ms| backend::fingerprint(ms))
-                        .unwrap_or(fp);
-                    v["observation"] = self.record_observation(&m, w, h, generation, fp_now);
-                    return partial_result(v, Some(png));
-                }
-                None => {
-                    v["error"] = serde_json::json!({"code": "OBSERVATION_FAILED_AFTER_INPUT", "message": "input was attempted but the post-action capture failed; call computer_observe"});
-                    return partial_result(v, None);
-                }
-            }
-        }
-
         match post_obs {
-            Some((m, png, w, h)) => {
-                let generation = self.state.generation.load(Ordering::SeqCst);
-                let fp_now = post
-                    .as_ref()
-                    .map(|ms| backend::fingerprint(ms))
-                    .unwrap_or(fp);
+            Some((m, png, w, h)) if delivery == backend::Delivery::Completed && !raced => {
+                let (g, f) = verified.unwrap();
                 let mut v = serde_json::json!({
                     "outcome": "ok",
                     "effect": "completed",
                     "action": action_json,
                 });
-                v["observation"] = self.record_observation(&m, w, h, generation, fp_now);
+                v["observation"] = self.record_observation(&m, w, h, g, f);
                 ok_result(v, Some(png))
             }
-            None => partial_result(
-                serde_json::json!({
+            _ => {
+                let mut v = serde_json::json!({
                     "outcome": "partial",
-                    "effect": "completed",
+                    "effect": effect,
                     "action": action_json,
                     "do_not_replay": true,
-                    "error": {"code": "SCREENSHOT_FAILED_AFTER_ACTION", "message": "input completed but the post-action capture failed; call computer_observe, do not repeat the action"},
-                }),
-                None,
-            ),
+                    "display_changed_during_action": raced,
+                });
+                match post_obs {
+                    Some((m, png, w, h)) => {
+                        // Valid observation under the NEW configuration; it is
+                        // current and actionable even though the action raced.
+                        let (g, f) = verified.unwrap();
+                        v["observation"] = self.record_observation(&m, w, h, g, f);
+                        partial_result(v, Some(png))
+                    }
+                    None => {
+                        v["error"] = serde_json::json!({"code": "OBSERVATION_FAILED_AFTER_INPUT", "message": "input was attempted but no stable post-action observation could be produced; call computer_observe, do not repeat the action"});
+                        partial_result(v, None)
+                    }
+                }
+            }
         }
     }
 }
@@ -697,7 +716,7 @@ async fn key_chord(
     keyboard: &Arc<Keyboard>,
     mods: &[String],
     key: &str,
-    guard: backend::Guard,
+    abort: Arc<backend::Abort>,
 ) -> Result<backend::Delivery, String> {
     // Caller validated every modifier name already.
     let names: Vec<String> = mods
@@ -721,7 +740,7 @@ async fn key_chord(
         ops.push(KeyOp::Mods { names: vec![] });
     }
     let kb = keyboard.clone();
-    tokio::task::spawn_blocking(move || kb.apply(ops, guard))
+    tokio::task::spawn_blocking(move || kb.apply(ops, abort))
         .await
         .unwrap_or(Ok(backend::Delivery::Unknown))
 }
@@ -732,14 +751,29 @@ async fn type_text(
     keyboard: &Arc<Keyboard>,
     text: &str,
     mods: Vec<String>,
-    guard: backend::Guard,
+    abort: Arc<backend::Abort>,
 ) -> backend::Delivery {
-    if backend::clipboard_set(text).await.is_err() {
-        return backend::Delivery::None;
+    match backend::clipboard_set(text).await {
+        Ok(()) => {}
+        // wl-copy never spawned: clipboard untouched, nothing happened.
+        Err(backend::BackendError::Missing(_)) => return backend::Delivery::None,
+        // wl-copy ran but failed (bad exit, timeout, broken stdin): the
+        // clipboard may already have been replaced, so report unknown.
+        Err(_) => return backend::Delivery::Unknown,
     }
-    match key_chord(keyboard, &mods, "v", guard).await {
+    match key_chord(keyboard, &mods, "v", abort).await {
+        // The paste never left the keyboard (backend down, action aborted),
+        // but the clipboard was still replaced: that is a side effect.
+        Ok(backend::Delivery::None) | Err(_) => backend::Delivery::Partial,
         Ok(d) => d,
-        Err(_) => backend::Delivery::Partial, // 'v'/ctrl/shift always resolve
+    }
+}
+
+/// Aborts the spawned task when the request scope ends.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
