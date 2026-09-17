@@ -1,0 +1,62 @@
+{
+  "approved": true,
+  "spec": {
+    "number": 1,
+    "url": "https://github.com/Klyve-09/computer_use/issues/1"
+  },
+  "prototype": {
+    "branch": "prototype/computer-use-coordinates",
+    "commit": "5c853b613b9bebbdb4743ad4cf4bb4471561dc14"
+  },
+  "tickets": [
+    {
+      "local": 1,
+      "number": 2,
+      "url": "https://github.com/Klyve-09/computer_use/issues/2",
+      "title": "01: Observe a selected Monitor from Codex",
+      "file": "issues/01-observe-monitors.md",
+      "blockers": []
+    },
+    {
+      "local": 2,
+      "number": 3,
+      "url": "https://github.com/Klyve-09/computer_use/issues/3",
+      "title": "02: Click and scroll on mixed-scale Monitors",
+      "file": "issues/02-pointer-actions.md",
+      "blockers": [
+        2
+      ]
+    },
+    {
+      "local": 3,
+      "number": 4,
+      "url": "https://github.com/Klyve-09/computer_use/issues/4",
+      "title": "03: Enter addresses and Korean text through Codex",
+      "file": "issues/03-keyboard-text.md",
+      "blockers": [
+        3
+      ]
+    },
+    {
+      "local": 4,
+      "number": 5,
+      "url": "https://github.com/Klyve-09/computer_use/issues/5",
+      "title": "04: Drag within and between mixed-scale Monitors",
+      "file": "issues/04-cross-monitor-drag.md",
+      "blockers": [
+        3
+      ]
+    },
+    {
+      "local": 5,
+      "number": 6,
+      "url": "https://github.com/Klyve-09/computer_use/issues/6",
+      "title": "05: Recover from display changes and interrupted actions",
+      "file": "issues/05-runtime-recovery.md",
+      "blockers": [
+        4,
+        5
+      ]
+    }
+  ]
+}
