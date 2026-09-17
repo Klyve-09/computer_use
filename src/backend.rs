@@ -517,11 +517,16 @@ pub enum Delivery {
     Unknown,
 }
 
+/// Mid-action abort signal: (live generation counter, value the action was
+/// validated against). Sessions check it between ops; a mismatch stops the
+/// remaining intended input, releases held state, and reports Partial.
+pub type Guard = Option<(Arc<AtomicU64>, u64)>;
+
 pub struct Pointer {
     tx: std::sync::mpsc::Sender<
         (
             Vec<PointerOp>,
-            Option<(Arc<AtomicU64>, u64)>,
+            Guard,
             std::sync::mpsc::Sender<Delivery>,
         ),
     >,
@@ -534,7 +539,7 @@ impl Pointer {
     pub fn start() -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<(
             Vec<PointerOp>,
-            Option<(Arc<AtomicU64>, u64)>,
+            Guard,
             std::sync::mpsc::Sender<Delivery>,
         )>();
         std::thread::spawn(move || {
@@ -560,7 +565,7 @@ impl Pointer {
     /// `guard` is (generation counter, expected value): when the generation
     /// has moved on (display change mid-action), remaining ops are skipped and
     /// held inputs released before returning Partial.
-    pub fn apply(&self, ops: Vec<PointerOp>, guard: Option<(Arc<AtomicU64>, u64)>) -> Delivery {
+    pub fn apply(&self, ops: Vec<PointerOp>, guard: Guard) -> Delivery {
         let (reply, rx) = std::sync::mpsc::channel();
         if self.tx.send((ops, guard, reply)).is_err() {
             return Delivery::None;
@@ -572,9 +577,8 @@ impl Pointer {
 }
 
 mod pointer_session {
-    use super::{Delivery, PointerOp};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use super::{Delivery, Guard, PointerOp};
+    use std::sync::atomic::Ordering;
     use wayland_client::globals::{GlobalListContents, registry_queue_init};
     use wayland_client::protocol::{wl_output, wl_pointer, wl_registry};
     use wayland_client::{Connection, Dispatch, QueueHandle};
@@ -587,6 +591,16 @@ mod pointer_session {
         held: std::collections::HashSet<u32>,
         time_ms: u32,
         pub broken: bool,
+    }
+
+    impl Drop for Session {
+        /// A dropped session (replaced after failure or thread exit) attempts
+        /// one final release of held buttons before teardown.
+        fn drop(&mut self) {
+            if !self.held.is_empty() {
+                self.release_all();
+            }
+        }
     }
 
     struct State;
@@ -693,7 +707,7 @@ mod pointer_session {
         pub fn apply(
             &mut self,
             ops: &[PointerOp],
-            guard: &Option<(Arc<AtomicU64>, u64)>,
+            guard: &Guard,
         ) -> Delivery {
             let mut sent = false;
             for op in ops {
@@ -815,7 +829,7 @@ pub enum KeyOp {
 pub struct Keyboard {
     tx: std::sync::mpsc::Sender<(
         Vec<KeyOp>,
-        Option<(Arc<AtomicU64>, u64)>,
+        Guard,
         std::sync::mpsc::Sender<Result<Delivery, String>>,
     )>,
 }
@@ -824,7 +838,7 @@ impl Keyboard {
     pub fn start() -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<(
             Vec<KeyOp>,
-            Option<(Arc<AtomicU64>, u64)>,
+            Guard,
             std::sync::mpsc::Sender<Result<Delivery, String>>,
         )>();
         std::thread::spawn(move || {
@@ -852,7 +866,7 @@ impl Keyboard {
     pub fn apply(
         &self,
         ops: Vec<KeyOp>,
-        guard: Option<(Arc<AtomicU64>, u64)>,
+        guard: Guard,
     ) -> Result<Delivery, String> {
         let (reply, rx) = std::sync::mpsc::channel();
         if self.tx.send((ops, guard, reply)).is_err() {
@@ -864,10 +878,9 @@ impl Keyboard {
 }
 
 mod keyboard_session {
-    use super::{Delivery, KeyOp};
+    use super::{Delivery, Guard, KeyOp};
     use std::collections::HashSet;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::Ordering;
     use std::io::Write;
     use std::os::fd::AsFd;
     use wayland_client::globals::{GlobalListContents, registry_queue_init};
@@ -885,6 +898,14 @@ mod keyboard_session {
         mods_depressed: u32,
         time_ms: u32,
         pub broken: bool,
+    }
+
+    impl Drop for Session {
+        fn drop(&mut self) {
+            if !self.held.is_empty() || self.mods_depressed != 0 {
+                self.release_all();
+            }
+        }
     }
 
     struct State;
@@ -1055,7 +1076,7 @@ mod keyboard_session {
         pub fn apply(
             &mut self,
             ops: &[KeyOp],
-            guard: &Option<(Arc<AtomicU64>, u64)>,
+            guard: &Guard,
         ) -> Result<Delivery, String> {
             // Resolve every name first so an unknown key/modifier rejects the
             // whole batch before any event is emitted.

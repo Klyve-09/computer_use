@@ -359,6 +359,12 @@ impl ComputerUse {
             Err(e) => return backend_error(e),
         };
         let fp = backend::fingerprint(&snapshot);
+        if !self.state.actionable() {
+            return action_err(
+                "EVENT_CHANNEL_UNHEALTHY",
+                "display-change notification channel is down; mutation paused until it recovers",
+            );
+        }
         let obs = match self.state.validate_observation(&p.observation_id, fp) {
             Ok(o) => o,
             Err(msg) => {
@@ -368,12 +374,6 @@ impl ComputerUse {
                 );
             }
         };
-        if !self.state.actionable() {
-            return action_err(
-                "EVENT_CHANNEL_UNHEALTHY",
-                "display-change notification channel is down; mutation paused until it recovers",
-            );
-        }
         let Some(monitor) = snapshot.iter().find(|m| m.name == obs.monitor) else {
             return action_err("MONITOR_NOT_FOUND", "observation's monitor is gone");
         };
@@ -697,7 +697,7 @@ async fn key_chord(
     keyboard: &Arc<Keyboard>,
     mods: &[String],
     key: &str,
-    guard: Option<(Arc<AtomicU64>, u64)>,
+    guard: backend::Guard,
 ) -> Result<backend::Delivery, String> {
     // Caller validated every modifier name already.
     let names: Vec<String> = mods
@@ -732,7 +732,7 @@ async fn type_text(
     keyboard: &Arc<Keyboard>,
     text: &str,
     mods: Vec<String>,
-    guard: Option<(Arc<AtomicU64>, u64)>,
+    guard: backend::Guard,
 ) -> backend::Delivery {
     if backend::clipboard_set(text).await.is_err() {
         return backend::Delivery::None;

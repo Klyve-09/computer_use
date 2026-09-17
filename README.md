@@ -109,6 +109,10 @@ observation of a monitor supersedes earlier IDs for that monitor.
   generation unconditionally.
 - `wl_output` reports integer scale factors only; it is used purely as an
   invalidation signal, never for coordinate math.
+- Both invalidation channels are asynchronous: a change-and-restore that
+  completes entirely inside the event-delivery gap can pass the generation
+  check. The window is small (event latency, not polling) but nonzero —
+  mutation is best-effort protected, never transactional.
 - Pointer input uses one persistent output-unmapped
   `zwlr_virtual_pointer_v1` mapped onto the bounding box of the whole logical
   layout; scroll uses wheel `axis_discrete` + `axis` (120/step). Keyboard

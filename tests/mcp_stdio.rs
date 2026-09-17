@@ -230,6 +230,10 @@ fn key_and_text_rejections() {
     // Invalid paste mode must reject BEFORE the clipboard is replaced.
     if Command::new("wl-copy")
         .arg("sentinel")
+        // wl-copy forks a clipboard daemon; null stdio so it can't hold the
+        // test harness's pipes open.
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
     {
