@@ -187,6 +187,64 @@ fn action_rejects_stale_and_invalid_without_input() {
 }
 
 #[test]
+fn key_and_text_rejections() {
+    let Some(mut c) = Client::start() else { return };
+    init(&mut c);
+
+    // Stale/unknown observation -> rejected before any input.
+    for action in [
+        json!({"kind": "key", "key": "a"}),
+        json!({"kind": "type_text", "text": "hello"}),
+    ] {
+        let r = c.call_tool(
+            "computer_action",
+            json!({"observation_id": "bogus", "action": action}),
+        );
+        assert_eq!(
+            r["result"]["structuredContent"]["error"]["code"], "STALE_OBSERVATION",
+            "{r}"
+        );
+        assert_eq!(r["result"]["structuredContent"]["effect"], "none");
+    }
+
+    let obs = c.call_tool("computer_observe", json!({"monitor": "eDP-1"}));
+    let oid = obs["result"]["structuredContent"]["observation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Unknown modifier name -> rejected before any key event.
+    let bad_mod = c.call_tool(
+        "computer_action",
+        json!({"observation_id": oid, "action": {"kind": "key", "key": "a", "mods": ["banana"]}}),
+    );
+    let code = bad_mod["result"]["structuredContent"]["error"]["code"]
+        .as_str()
+        .unwrap_or("");
+    // Focus may not be on eDP-1 in a test run; either rejection is acceptable.
+    assert!(
+        code == "INVALID_MODIFIER" || code == "FOCUS_MISMATCH",
+        "{bad_mod}"
+    );
+
+    // Key name that resolves to no keycode -> rejected before any event;
+    // the observation is consumed (post-action observe supersedes it only on
+    // success, so reuse a fresh one if needed).
+    let bad_key = c.call_tool(
+        "computer_action",
+        json!({"observation_id": oid, "action": {"kind": "key", "key": "NoSuchKeysym42"}}),
+    );
+    let code = bad_key["result"]["structuredContent"]["error"]["code"]
+        .as_str()
+        .unwrap_or("");
+    // Focus may not be on eDP-1 in a test run; either rejection is acceptable.
+    assert!(
+        code == "INVALID_KEY" || code == "FOCUS_MISMATCH",
+        "{bad_key}"
+    );
+}
+
+#[test]
 fn unknown_tool_is_protocol_error() {
     let Some(mut c) = Client::start() else { return };
     init(&mut c);

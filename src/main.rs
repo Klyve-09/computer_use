@@ -1,6 +1,6 @@
 mod backend;
 
-use backend::{BackendError, Monitor, Pointer, PointerOp};
+use backend::{BackendError, KeyOp, Keyboard, Monitor, Pointer, PointerOp};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock as Content, ErrorData as McpError};
 use rmcp::service::ServiceExt;
@@ -44,6 +44,21 @@ pub enum ActionKind {
         dx: i32,
         #[serde(default)]
         dy: i32,
+    },
+    /// Key press with optional modifiers (e.g. key "return", mods ["ctrl"]).
+    /// Acts on the focused application on the observed monitor.
+    Key {
+        key: String,
+        #[serde(default)]
+        mods: Vec<String>,
+    },
+    /// Enter exact UTF-8 text via clipboard + paste shortcut.
+    /// Replaces the clipboard. `paste`: "ctrl_v" (default) or
+    /// "ctrl_shift_v" (terminals).
+    TypeText {
+        text: String,
+        #[serde(default)]
+        paste: Option<String>,
     },
 }
 
@@ -120,6 +135,7 @@ impl State {
 struct ComputerUse {
     state: Arc<State>,
     pointer: Arc<Pointer>,
+    keyboard: Arc<Keyboard>,
     /// Input is serialized: no two actions may interleave pointer events.
     action_lock: Arc<tokio::sync::Mutex<()>>,
     #[allow(dead_code)] // read by the #[tool_handler]-generated call_tool
@@ -140,6 +156,7 @@ impl ComputerUse {
         Self {
             state,
             pointer: Arc::new(Pointer::start()),
+            keyboard: Arc::new(Keyboard::start()),
             action_lock: Arc::new(tokio::sync::Mutex::new(())),
             tool_router: Self::tool_router(),
         }
@@ -309,8 +326,10 @@ impl ComputerUse {
         )
     }
 
-    /// Execute one click or scroll Action against the point the referenced
-    /// observation showed, then return a fresh observation of that Monitor.
+    /// Execute one click, scroll, key, or type_text Action against the
+    /// referenced observation, then return a fresh observation of that
+    /// Monitor. type_text replaces the clipboard; key/type_text act on the
+    /// focused window, which must live on the observed monitor.
     /// Input coordinates are image pixels; the server performs all scaling.
     /// Serialized with every other action. On partial/unknown delivery or a
     /// failed post-action capture, do NOT repeat the action — call
@@ -345,76 +364,116 @@ impl ComputerUse {
         let Some(monitor) = snapshot.iter().find(|m| m.name == obs.monitor) else {
             return action_err("MONITOR_NOT_FOUND", "observation's monitor is gone");
         };
-        let Some(layout) = backend::layout_box(&snapshot) else {
-            return action_err("NO_LAYOUT", "no selectable monitors");
-        };
-        let (px, py) = match &p.action {
-            ActionKind::Click { x, y, .. } | ActionKind::Scroll { x, y, .. } => (*x, *y),
-        };
-        let Some((ax, ay)) =
-            backend::map_point(px, py, obs.image_width, obs.image_height, monitor, &layout)
-        else {
-            return action_err(
-                "INVALID_COORDINATES",
-                format!(
-                    "point ({px}, {py}) is outside the {0}x{1} image",
-                    obs.image_width, obs.image_height
-                ),
-            );
-        };
-
-        let mut ops = vec![
-            PointerOp::Move {
-                x: ax,
-                y: ay,
-                x_extent: layout.x_extent,
-                y_extent: layout.y_extent,
-            },
-            PointerOp::Frame,
-        ];
-        match &p.action {
-            ActionKind::Click { button, double, .. } => {
-                let code = match button {
-                    ClickButton::Left => backend::BTN_LEFT,
-                    ClickButton::Right => backend::BTN_RIGHT,
-                };
-                let presses = if *double { 2 } else { 1 };
-                for _ in 0..presses {
-                    ops.push(PointerOp::Button {
-                        code,
-                        pressed: true,
-                    });
-                    ops.push(PointerOp::Button {
-                        code,
-                        pressed: false,
-                    });
+        // Keyboard/text actions act on the focused window; it must live on
+        // the observed monitor, else reject before any input.
+        if matches!(
+            p.action,
+            ActionKind::Key { .. } | ActionKind::TypeText { .. }
+        ) {
+            match backend::focused_monitor().await {
+                Ok(Some(name)) if name == obs.monitor => {}
+                Ok(_) => {
+                    return action_err(
+                        "FOCUS_MISMATCH",
+                        "focus is on another monitor or nothing is focused; click the target first",
+                    );
                 }
-                ops.push(PointerOp::Frame);
-            }
-            ActionKind::Scroll { dx, dy, .. } => {
-                if *dx == 0 && *dy == 0 {
-                    return action_err("INVALID_SCROLL", "dx and dy are both 0; nothing to scroll");
-                }
-                if *dy != 0 {
-                    ops.push(PointerOp::Scroll {
-                        axis: 0,
-                        steps: *dy,
-                    });
-                }
-                if *dx != 0 {
-                    ops.push(PointerOp::Scroll {
-                        axis: 1,
-                        steps: *dx,
-                    });
-                }
-                ops.push(PointerOp::Frame);
+                Err(e) => return backend_error(e),
             }
         }
 
-        let pointer = self.pointer.clone();
-        let delivery = tokio::task::spawn_blocking(move || pointer.apply(ops))
-            .await
-            .unwrap_or(backend::Delivery::Unknown);
+        let delivery = match &p.action {
+            ActionKind::Key { key, mods } => {
+                if let Some(bad) = mods.iter().find(|m| modifier(m).is_none()) {
+                    return action_err(
+                        "INVALID_MODIFIER",
+                        format!("unknown modifier {bad:?}; use ctrl/shift/alt/super"),
+                    );
+                }
+                match key_chord(&self.keyboard, mods, key).await {
+                    Ok(d) => d,
+                    Err(msg) => return action_err("INVALID_KEY", msg),
+                }
+            }
+            ActionKind::TypeText { text, paste } => {
+                type_text(&self.keyboard, text, paste.as_deref()).await
+            }
+            ActionKind::Click { .. } | ActionKind::Scroll { .. } => {
+                let Some(layout) = backend::layout_box(&snapshot) else {
+                    return action_err("NO_LAYOUT", "no selectable monitors");
+                };
+                let (px, py) = match &p.action {
+                    ActionKind::Click { x, y, .. } | ActionKind::Scroll { x, y, .. } => (*x, *y),
+                    _ => unreachable!(),
+                };
+                let Some((ax, ay)) =
+                    backend::map_point(px, py, obs.image_width, obs.image_height, monitor, &layout)
+                else {
+                    return action_err(
+                        "INVALID_COORDINATES",
+                        format!(
+                            "point ({px}, {py}) is outside the {}x{} image",
+                            obs.image_width, obs.image_height
+                        ),
+                    );
+                };
+                let mut ops = vec![
+                    PointerOp::Move {
+                        x: ax,
+                        y: ay,
+                        x_extent: layout.x_extent,
+                        y_extent: layout.y_extent,
+                    },
+                    PointerOp::Frame,
+                ];
+                match &p.action {
+                    ActionKind::Click { button, double, .. } => {
+                        let code = match button {
+                            ClickButton::Left => backend::BTN_LEFT,
+                            ClickButton::Right => backend::BTN_RIGHT,
+                        };
+                        let presses = if *double { 2 } else { 1 };
+                        for _ in 0..presses {
+                            ops.push(PointerOp::Button {
+                                code,
+                                pressed: true,
+                            });
+                            ops.push(PointerOp::Button {
+                                code,
+                                pressed: false,
+                            });
+                        }
+                        ops.push(PointerOp::Frame);
+                    }
+                    ActionKind::Scroll { dx, dy, .. } => {
+                        if *dx == 0 && *dy == 0 {
+                            return action_err(
+                                "INVALID_SCROLL",
+                                "dx and dy are both 0; nothing to scroll",
+                            );
+                        }
+                        if *dy != 0 {
+                            ops.push(PointerOp::Scroll {
+                                axis: 0,
+                                steps: *dy,
+                            });
+                        }
+                        if *dx != 0 {
+                            ops.push(PointerOp::Scroll {
+                                axis: 1,
+                                steps: *dx,
+                            });
+                        }
+                        ops.push(PointerOp::Frame);
+                    }
+                    _ => unreachable!(),
+                }
+                let pointer = self.pointer.clone();
+                tokio::task::spawn_blocking(move || pointer.apply(ops))
+                    .await
+                    .unwrap_or(backend::Delivery::Unknown)
+            }
+        };
 
         // Bounded settling interval before post-action capture. This is an
         // observation time, not proof the application finished reacting.
@@ -439,8 +498,8 @@ impl ComputerUse {
 
         if delivery == backend::Delivery::None {
             return action_err(
-                "POINTER_UNAVAILABLE",
-                "virtual pointer backend unavailable; no input was sent",
+                "INPUT_BACKEND_UNAVAILABLE",
+                "input backend unavailable or action rejected before any input was sent",
             );
         }
 
@@ -513,6 +572,70 @@ impl ComputerUse {
     }
 }
 
+/// Modifier name -> xkb modifier name on the uploaded keymap.
+fn modifier(name: &str) -> Option<&'static str> {
+    match name.to_ascii_lowercase().as_str() {
+        "ctrl" | "control" => Some("Control"),
+        "shift" => Some("Shift"),
+        "alt" | "mod1" => Some("Mod1"),
+        "super" | "meta" | "logo" | "mod4" => Some("Mod4"),
+        _ => None,
+    }
+}
+
+/// One batched event list: set depressed mods, key down+up, clear mods. The
+/// keyboard session resolves names before emitting anything, so an unknown
+/// name is Err (a rejection); a mid-batch transport failure is
+/// Partial/Unknown with a best-effort release of keys and modifiers.
+async fn key_chord(
+    keyboard: &Arc<Keyboard>,
+    mods: &[String],
+    key: &str,
+) -> Result<backend::Delivery, String> {
+    let mut ops: Vec<KeyOp> = Vec::new();
+    if !mods.is_empty() {
+        ops.push(KeyOp::Mods {
+            names: mods
+                .iter()
+                .map(|m| modifier(m).unwrap().to_string())
+                .collect(),
+        });
+    }
+    ops.push(KeyOp::Key {
+        name: key.to_string(),
+        pressed: true,
+    });
+    ops.push(KeyOp::Key {
+        name: key.to_string(),
+        pressed: false,
+    });
+    if !mods.is_empty() {
+        ops.push(KeyOp::Mods { names: vec![] });
+    }
+    let kb = keyboard.clone();
+    tokio::task::spawn_blocking(move || kb.apply(ops))
+        .await
+        .unwrap_or(Ok(backend::Delivery::Unknown))
+}
+
+/// Clipboard-set then paste shortcut. Clipboard replacement alone is a side
+/// effect: a paste failure after it is `partial`, never `none`.
+async fn type_text(keyboard: &Arc<Keyboard>, text: &str, paste: Option<&str>) -> backend::Delivery {
+    if backend::clipboard_set(text).await.is_err() {
+        return backend::Delivery::None;
+    }
+    let mods: &[&str] = match paste.unwrap_or("ctrl_v") {
+        "ctrl_v" => &["ctrl"],
+        "ctrl_shift_v" => &["ctrl", "shift"],
+        _ => return backend::Delivery::Partial, // clipboard already replaced
+    };
+    let owned: Vec<String> = mods.iter().map(|s| s.to_string()).collect();
+    match key_chord(keyboard, &owned, "v").await {
+        Ok(d) => d,
+        Err(_) => backend::Delivery::Partial, // 'v'/ctrl/shift always resolve
+    }
+}
+
 /// Result with possible input side effects: isError + a prominent no-replay
 /// warning text block, then the compact JSON and optional image.
 fn partial_result(
@@ -547,7 +670,9 @@ impl ServerHandler for ComputerUse {
         info.instructions = Some(
             "Screenshot-based control of the user's Hyprland desktop. \
              computer_monitors lists selectable monitors; computer_observe returns a \
-             PNG screenshot and an opaque observation_id for later actions."
+             PNG screenshot and an opaque observation_id; computer_action performs one \
+             click/scroll/key/type_text action at observation coordinates and returns a \
+             fresh screenshot. Never repeat a partial/unknown action blindly."
                 .into(),
         );
         info

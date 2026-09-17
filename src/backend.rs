@@ -23,6 +23,14 @@ pub struct Monitor {
     pub transform: u8,
     #[serde(default)]
     pub disabled: bool,
+    #[serde(default)]
+    pub id: i64,
+}
+
+impl Monitor {
+    fn id_or_name_matches(&self, want: i64) -> bool {
+        self.id == want
+    }
 }
 
 impl Monitor {
@@ -121,6 +129,61 @@ pub async fn monitors() -> Result<Vec<Monitor>, BackendError> {
     .await?;
     serde_json::from_slice(&out)
         .map_err(|e| BackendError::Failed(format!("hyprctl monitors parse: {e}")))
+}
+
+/// Name of the monitor that owns the currently focused window, if any.
+pub async fn focused_monitor() -> Result<Option<String>, BackendError> {
+    let out = run(
+        session_env(Command::new("hyprctl").args(["-j", "activewindow"])),
+        HYPRCTL_TIMEOUT,
+        "hyprctl activewindow",
+    )
+    .await?;
+    if out.iter().all(|b| b.is_ascii_whitespace()) {
+        return Ok(None); // empty output: nothing focused
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out)
+        .map_err(|e| BackendError::Failed(format!("activewindow parse: {e}")))?;
+    // activewindow reports a monitor id; map it via the monitor list.
+    let Some(want) = v.get("monitor").and_then(|m| m.as_i64()) else {
+        return Ok(None);
+    };
+    let monitors = monitors().await?;
+    Ok(monitors
+        .into_iter()
+        .find(|m| m.id_or_name_matches(want))
+        .map(|m| m.name))
+}
+
+/// Replace the clipboard with the exact UTF-8 text (stdin, never shell).
+pub async fn clipboard_set(text: &str) -> Result<(), BackendError> {
+    let mut child =
+        session_env(Command::new("wl-copy").args(["--type", "text/plain;charset=utf-8"]))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    BackendError::Missing("wl-copy")
+                } else {
+                    BackendError::Failed(format!("wl-copy spawn: {e}"))
+                }
+            })?;
+    use tokio::io::AsyncWriteExt;
+    let mut stdin = child.stdin.take().unwrap();
+    let write = async move {
+        stdin.write_all(text.as_bytes()).await?;
+        stdin.shutdown().await
+    };
+    let (wres, cres) = tokio::join!(write, tokio::time::timeout(HYPRCTL_TIMEOUT, child.wait()));
+    wres.map_err(|e| BackendError::Failed(format!("wl-copy stdin: {e}")))?;
+    match cres {
+        Err(_) => Err(BackendError::Timeout("wl-copy")),
+        Ok(Err(e)) => Err(BackendError::Failed(format!("wl-copy: {e}"))),
+        Ok(Ok(s)) if !s.success() => Err(BackendError::Failed(format!("wl-copy exited {s}"))),
+        Ok(Ok(_)) => Ok(()),
+    }
 }
 
 /// Capture one monitor as PNG via `grim -o <name> -t png -`.
@@ -675,6 +738,348 @@ mod pointer_session {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Persistent virtual keyboard (zwlr_virtual_keyboard_v1).
+//
+// Hyprland 0.56.2's Lua dispatchers (hl.dsp.send_key_state / send_shortcut)
+// return "ok" but deliver no key events to Wayland-native clients — verified
+// live against gnome-text-editor. The compositor DOES expose
+// zwlr_virtual_keyboard_manager_v1, the same mechanism wtype uses, so keys go
+// through a real virtual input device instead.
+// ---------------------------------------------------------------------------
+
+/// One keyboard operation. `Key` presses/releases a keysym name resolved
+/// against the uploaded keymap ("Return", "a"). `Mods` sets the depressed
+/// modifier mask from xkb modifier names ("Control", "Shift", "Mod1", "Mod4") —
+/// the client only sees modifiers via the dedicated `modifiers` event, so
+/// pressing a modifier *key* alone does nothing.
+#[derive(Debug)]
+pub enum KeyOp {
+    Key { name: String, pressed: bool },
+    Mods { names: Vec<String> },
+}
+
+/// apply() result: Err(name) means `name` resolved to no keycode — nothing was
+/// sent, treat as a caller error rather than a backend failure.
+pub struct Keyboard {
+    tx: std::sync::mpsc::Sender<(
+        Vec<KeyOp>,
+        std::sync::mpsc::Sender<Result<Delivery, String>>,
+    )>,
+}
+
+impl Keyboard {
+    pub fn start() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<(
+            Vec<KeyOp>,
+            std::sync::mpsc::Sender<Result<Delivery, String>>,
+        )>();
+        std::thread::spawn(move || {
+            let mut session: Option<keyboard_session::Session> = None;
+            for (ops, reply) in rx {
+                if session.is_none() {
+                    session = keyboard_session::Session::connect().ok();
+                }
+                let result = match session.as_mut() {
+                    None => Ok(Delivery::None),
+                    Some(s) => s.apply(&ops),
+                };
+                let _ = reply.send(result);
+                if session.as_ref().is_some_and(|s| s.broken) {
+                    session = None;
+                }
+            }
+        });
+        Self { tx }
+    }
+
+    /// Blocks until the key list is delivered or fails. Call from spawn_blocking.
+    pub fn apply(&self, ops: Vec<KeyOp>) -> Result<Delivery, String> {
+        let (reply, rx) = std::sync::mpsc::channel();
+        if self.tx.send((ops, reply)).is_err() {
+            return Ok(Delivery::None);
+        }
+        rx.recv_timeout(Duration::from_secs(10))
+            .unwrap_or(Ok(Delivery::Unknown))
+    }
+}
+
+mod keyboard_session {
+    use super::{Delivery, KeyOp};
+    use std::collections::HashSet;
+    use std::io::Write;
+    use std::os::fd::AsFd;
+    use wayland_client::globals::{GlobalListContents, registry_queue_init};
+    use wayland_client::protocol::{wl_keyboard, wl_registry, wl_seat};
+    use wayland_client::{Connection, Dispatch, QueueHandle};
+    use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
+    use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1;
+    use xkbcommon::xkb;
+
+    pub struct Session {
+        conn: Connection,
+        keyboard: ZwpVirtualKeyboardV1,
+        keymap: xkb::Keymap,
+        held: HashSet<u32>,
+        mods_depressed: u32,
+        time_ms: u32,
+        pub broken: bool,
+    }
+
+    struct State;
+
+    impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
+        fn event(
+            _: &mut Self,
+            _: &wl_registry::WlRegistry,
+            _: wl_registry::Event,
+            _: &GlobalListContents,
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+    impl Dispatch<wl_seat::WlSeat, ()> for State {
+        fn event(
+            _: &mut Self,
+            _: &wl_seat::WlSeat,
+            _: wl_seat::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+    impl Dispatch<ZwpVirtualKeyboardManagerV1, ()> for State {
+        fn event(
+            _: &mut Self,
+            _: &ZwpVirtualKeyboardManagerV1,
+            _: <ZwpVirtualKeyboardManagerV1 as wayland_client::Proxy>::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+    impl Dispatch<ZwpVirtualKeyboardV1, ()> for State {
+        fn event(
+            _: &mut Self,
+            _: &ZwpVirtualKeyboardV1,
+            _: <ZwpVirtualKeyboardV1 as wayland_client::Proxy>::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    impl Session {
+        pub fn connect() -> Result<Self, Box<dyn std::error::Error>> {
+            let path = super::wayland_socket_path().ok_or("no wayland session")?;
+            let stream = std::os::unix::net::UnixStream::connect(path)?;
+            let backend = wayland_client::backend::Backend::connect(stream)?;
+            let conn = Connection::from_backend(backend);
+            let (globals, mut queue) = registry_queue_init::<State>(&conn)?;
+            let mut state = State;
+            queue.roundtrip(&mut state)?;
+            let mut manager = None;
+            let mut seat = None;
+            for g in globals.contents().clone_list() {
+                if g.interface == "zwp_virtual_keyboard_manager_v1" {
+                    manager = Some(
+                        globals
+                            .registry()
+                            .bind::<ZwpVirtualKeyboardManagerV1, _, _>(
+                                g.name,
+                                g.version.min(1),
+                                &queue.handle(),
+                                (),
+                            ),
+                    );
+                } else if g.interface == "wl_seat" && seat.is_none() {
+                    seat = Some(globals.registry().bind::<wl_seat::WlSeat, _, _>(
+                        g.name,
+                        g.version.min(1),
+                        &queue.handle(),
+                        (),
+                    ));
+                }
+            }
+            let manager = manager.ok_or("zwp_virtual_keyboard_manager_v1 not advertised")?;
+            let seat = seat.ok_or("no wl_seat advertised")?;
+            let keyboard = manager.create_virtual_keyboard(&seat, &queue.handle(), ());
+
+            // Upload a keymap before any key event (protocol requirement).
+            let ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+            let keymap = xkb::Keymap::new_from_names(
+                &ctx,
+                "",
+                "",
+                "",
+                "",
+                None,
+                xkb::KEYMAP_COMPILE_NO_FLAGS,
+            )
+            .ok_or("xkb keymap compile failed")?;
+            let text = keymap.get_as_string(xkb::FORMAT_TEXT_V1);
+            let memfd = memfd::MemfdOptions::default()
+                .close_on_exec(true)
+                .create("computer-use-keymap")?;
+            memfd.as_file().write_all(text.as_bytes())?;
+            let fd = memfd.into_file();
+            keyboard.keymap(
+                wl_keyboard::KeymapFormat::XkbV1.into(),
+                fd.as_fd(),
+                text.len() as u32,
+            );
+            queue.roundtrip(&mut state)?;
+            Ok(Self {
+                conn,
+                keyboard,
+                keymap,
+                held: Default::default(),
+                mods_depressed: 0,
+                time_ms: 0,
+                broken: false,
+            })
+        }
+
+        fn tick(&mut self) -> u32 {
+            self.time_ms = self.time_ms.wrapping_add(1);
+            self.time_ms
+        }
+
+        /// Keysym name -> evdev keycode. xkb keycodes are evdev+8; the
+        /// virtual-keyboard `key` request takes evdev codes, so subtract 8.
+        /// Accepts the usual keysym spellings plus lowercase/capitalized
+        /// fallbacks.
+        fn keycode_for(&self, name: &str) -> Option<u32> {
+            let sym = [name, &name.to_lowercase(), &capitalize(name)]
+                .into_iter()
+                .map(|n| xkb::keysym_from_name(n, xkb::KEYSYM_NO_FLAGS))
+                .find(|s| s.raw() != xkb::keysyms::KEY_NoSymbol)?;
+            let min: u32 = self.keymap.min_keycode().into();
+            let max: u32 = self.keymap.max_keycode().into();
+            for raw in min..=max {
+                if self
+                    .keymap
+                    .key_get_syms_by_level(xkb::Keycode::new(raw), 0, 0)
+                    .contains(&sym)
+                {
+                    return raw.checked_sub(8);
+                }
+            }
+            None
+        }
+
+        /// xkb modifier name -> depressed-mask bit on the uploaded keymap.
+        fn mod_bit(&self, name: &str) -> Option<u32> {
+            let idx = self.keymap.mod_get_index(name);
+            (idx != xkb::MOD_INVALID).then(|| 1 << idx)
+        }
+
+        /// Best-effort release of every held key and depressed modifier,
+        /// ignoring further errors.
+        fn release_all(&mut self) {
+            for code in self.held.drain().collect::<Vec<_>>() {
+                let t = self.tick();
+                self.keyboard
+                    .key(t, code, wl_keyboard::KeyState::Released.into());
+            }
+            self.mods_depressed = 0;
+            self.keyboard.modifiers(0, 0, 0, 0);
+            let _ = self.conn.flush();
+        }
+
+        pub fn apply(&mut self, ops: &[KeyOp]) -> Result<Delivery, String> {
+            // Resolve every name first so an unknown key/modifier rejects the
+            // whole batch before any event is emitted.
+            enum Ev {
+                Key { code: u32, pressed: bool },
+                Mods { mask: u32 },
+            }
+            let mut events = Vec::with_capacity(ops.len());
+            for op in ops {
+                match op {
+                    KeyOp::Key { name, pressed } => {
+                        let Some(code) = self.keycode_for(name) else {
+                            return Err(format!("unknown key name {name:?}"));
+                        };
+                        events.push(Ev::Key {
+                            code,
+                            pressed: *pressed,
+                        });
+                    }
+                    KeyOp::Mods { names } => {
+                        let mut mask = 0u32;
+                        for n in names {
+                            let Some(bit) = self.mod_bit(n) else {
+                                return Err(format!("unknown modifier {n:?}"));
+                            };
+                            mask |= bit;
+                        }
+                        events.push(Ev::Mods { mask });
+                    }
+                }
+            }
+            let mut sent = false;
+            for ev in events {
+                match ev {
+                    Ev::Key { code, pressed } => {
+                        let t = self.tick();
+                        self.keyboard.key(
+                            t,
+                            code,
+                            if pressed {
+                                wl_keyboard::KeyState::Pressed
+                            } else {
+                                wl_keyboard::KeyState::Released
+                            }
+                            .into(),
+                        );
+                        if pressed {
+                            self.held.insert(code);
+                        } else {
+                            self.held.remove(&code);
+                        }
+                    }
+                    Ev::Mods { mask } => {
+                        self.mods_depressed = mask;
+                        self.keyboard.modifiers(mask, 0, 0, 0);
+                    }
+                }
+                sent = true;
+            }
+            if self.conn.flush().is_err() {
+                self.release_all();
+                self.broken = true;
+                return Ok(if sent {
+                    Delivery::Partial
+                } else {
+                    Delivery::None
+                });
+            }
+            match self.conn.roundtrip() {
+                Ok(_) => Ok(Delivery::Completed),
+                Err(e) => {
+                    eprintln!("keyboard roundtrip failed: {e}");
+                    self.release_all();
+                    self.broken = true;
+                    Ok(Delivery::Unknown)
+                }
+            }
+        }
+    }
+
+    fn capitalize(s: &str) -> String {
+        let mut c = s.chars();
+        match c.next() {
+            Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+            None => s.into(),
+        }
+    }
+}
+
 /// PNG IHDR dimensions, or None if not a PNG.
 pub fn png_size(png: &[u8]) -> Option<(u32, u32)> {
     if png.len() >= 24 && png[..8] == [137, 80, 78, 71, 13, 10, 26, 10] && &png[12..16] == b"IHDR" {
@@ -702,6 +1107,7 @@ mod tests {
             scale,
             transform: t,
             disabled: false,
+            id: 0,
         }
     }
 
