@@ -73,7 +73,7 @@ impl std::fmt::Display for BackendError {
 
 /// XDG_RUNTIME_DIR, or the standard /run/user/<uid> when a client (Codex)
 /// spawns us with a scrubbed environment.
-fn runtime_dir() -> Option<std::path::PathBuf> {
+pub(crate) fn runtime_dir() -> Option<std::path::PathBuf> {
     if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
         return Some(dir.into());
     }
@@ -135,6 +135,33 @@ pub async fn monitors() -> Result<Vec<Monitor>, BackendError> {
     .await?;
     serde_json::from_slice(&out)
         .map_err(|e| BackendError::Failed(format!("hyprctl monitors parse: {e}")))
+}
+
+/// Current Hyprland focused-window identity and logical bounds. Callers use
+/// this to bind semantic browser evidence to the real desktop window before
+/// translating CSS viewport coordinates into the screenshot coordinate space.
+pub async fn active_window() -> Result<serde_json::Value, BackendError> {
+    let out = run(
+        session_env(Command::new("hyprctl").args(["-j", "activewindow"])),
+        HYPRCTL_TIMEOUT,
+        "hyprctl activewindow",
+    )
+    .await?;
+    serde_json::from_slice(&out)
+        .map_err(|error| BackendError::Failed(format!("activewindow parse: {error}")))
+}
+
+/// All current Hyprland clients, used to reject browser evidence when the
+/// active browser surface cannot be uniquely tied to its compositor window.
+pub async fn clients() -> Result<Vec<serde_json::Value>, BackendError> {
+    let out = run(
+        session_env(Command::new("hyprctl").args(["-j", "clients"])),
+        HYPRCTL_TIMEOUT,
+        "hyprctl clients",
+    )
+    .await?;
+    serde_json::from_slice(&out)
+        .map_err(|error| BackendError::Failed(format!("clients parse: {error}")))
 }
 
 /// Name of the monitor that owns the currently focused window, if any.
@@ -248,6 +275,7 @@ async fn run(
     let child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -754,6 +782,20 @@ impl Pointer {
     }
 }
 
+/// Event timestamps must follow real elapsed time across separate Action calls
+/// and reconnects. A counter advanced per protocol operation makes unrelated
+/// clicks look like double/triple clicks to GTK, even seconds apart.
+fn input_time_ms() -> u32 {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: time is writable and CLOCK_MONOTONIC is supported on Linux.
+    let result = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) };
+    assert_eq!(result, 0, "monotonic input clock unavailable");
+    ((time.tv_sec as u64 * 1_000) + time.tv_nsec as u64 / 1_000_000) as u32
+}
+
 mod pointer_session {
     use super::{Abort, Delivery, PointerOp};
     use wayland_client::globals::{GlobalListContents, registry_queue_init};
@@ -769,7 +811,6 @@ mod pointer_session {
         /// Second fd onto the session socket; shutdown() wakes a wedged
         /// roundtrip. Shared with the caller via `Abort::kick`.
         pub kick: std::os::unix::net::UnixStream,
-        time_ms: u32,
         pub broken: bool,
     }
 
@@ -870,14 +911,12 @@ mod pointer_session {
                 pointer,
                 held: Default::default(),
                 kick,
-                time_ms: 0,
                 broken: false,
             })
         }
 
         fn tick(&mut self) -> u32 {
-            self.time_ms = self.time_ms.wrapping_add(1);
-            self.time_ms
+            super::input_time_ms()
         }
 
         /// Best-effort release of every held button, ignoring further errors.
@@ -946,9 +985,8 @@ mod pointer_session {
                     }
                     PointerOp::Wait { ms } => {
                         // Flush before sleeping so earlier events are already
-                        // on the wire; caps keep one action bounded. Advance
-                        // the event clock by the slept time so toolkits see
-                        // real gesture timing, not a jump. Sleep in chunks so
+                        // on the wire; caps keep one action bounded. Each event
+                        // uses monotonic elapsed time. Sleep in chunks so
                         // an abort mid-hold still stops the gesture promptly.
                         let _ = self.conn.flush();
                         let mut remaining = ms.min(2000);
@@ -965,7 +1003,6 @@ mod pointer_session {
                             std::thread::sleep(std::time::Duration::from_millis(step as u64));
                             remaining -= step;
                         }
-                        self.time_ms = self.time_ms.wrapping_add(ms.min(2000));
                     }
                     PointerOp::Frame => self.pointer.frame(),
                 }
@@ -1100,7 +1137,6 @@ mod keyboard_session {
         held: HashSet<u32>,
         pub kick: std::os::unix::net::UnixStream,
         mods_depressed: u32,
-        time_ms: u32,
         pub broken: bool,
     }
 
@@ -1228,14 +1264,12 @@ mod keyboard_session {
                 held: Default::default(),
                 kick,
                 mods_depressed: 0,
-                time_ms: 0,
                 broken: false,
             })
         }
 
         fn tick(&mut self) -> u32 {
-            self.time_ms = self.time_ms.wrapping_add(1);
-            self.time_ms
+            super::input_time_ms()
         }
 
         /// Keysym name -> evdev keycode. xkb keycodes are evdev+8; the
@@ -1393,6 +1427,14 @@ pub fn png_size(png: &[u8]) -> Option<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn input_clock_tracks_elapsed_time_between_actions() {
+        let before = super::input_time_ms();
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        let after = super::input_time_ms();
+        assert!(after.wrapping_sub(before) >= 20);
+    }
+
     use super::*;
 
     fn mon(name: &str, x: i32, y: i32, w: u32, h: u32, scale: f64, t: u8) -> Monitor {

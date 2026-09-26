@@ -7,11 +7,18 @@ Approved specification: GitHub issue
 
 ## Status
 
-Implemented (issues #2–#5): `computer_monitors`, `computer_observe`, and
+Implemented (issues #2–#6): `computer_monitors`, `computer_observe`, and
 `computer_action` — click/right-click/double-click, signed horizontal and
 vertical scroll, single keys and modifier chords, `type_text` (exact UTF-8
 text via clipboard + paste shortcut), and `drag` within or between
-monitors. Recovery hardening in #6.
+monitors. Recovery hardening is preserved. The opt-in bounded
+`computer_goal` Fast Path is experimental and documented in [`docs/jev-fast-path.md`](docs/jev-fast-path.md);
+it hands back when optional accessibility, browser, OCR, or Jev services are unavailable.
+Live validation covers native GTK/XWayland, Chrome (Wayland and XWayland),
+Firefox, and English/Korean OCR at the default 0.90 confidence floor. Browser
+input requires an operator-configured exact-origin allowlist in addition to
+explicit tab activation. See [validation and measured limits](docs/jev-fast-path-live-validation.md).
+Use the original screenshot/action workflow when the Fast Path hands back.
 
 ## Requirements
 
@@ -19,6 +26,9 @@ monitors. Recovery hardening in #6.
 - `grim`, `hyprctl`, and `wl-copy` on `PATH` (`wl-copy` for `type_text`)
 - `libxkbcommon` (used to build the virtual keyboard's keymap)
 - Rust stable toolchain to build (`rustup` works)
+- Optional for `computer_goal`: Python GI with AT-SPI 2 and a
+  `TYPESAFE_API_KEY`. Browser and OCR evidence also have separate optional
+  setup. The three original tools do not require these services.
 
 The server discovers the live session itself
 (`HYPRLAND_INSTANCE_SIGNATURE`, `XDG_RUNTIME_DIR`/`/run/user/<uid>`,
@@ -48,6 +58,7 @@ One command; no env flags needed because of the session discovery above.
 | `computer_monitors` | Lists selectable monitors: id (Hyprland output name), description, oriented logical bounds, scale, transform, plus an opaque `revision` and `events_healthy`. |
 | `computer_observe` | `{"monitor": "<id>"}` → PNG image block, `observation_id`, actual image dimensions, monitor summary, `revision`, `actionable`. |
 | `computer_action` | `{"observation_id": "<id>", "action": {"kind": ...}}` → performs one input action and returns a fresh observation of the same monitor. `effect` reports `none`/`completed`/`partial`/`unknown`; on partial/unknown or post-action capture failure the result says not to replay. |
+| `computer_goal` | Experimental native accessibility, local OCR, and current-tab browser evidence with Jev selection. Explicitly allowed browser origins support scoped actions, including Netflix media playback. It reobserves after each action and returns verified completion or a handback with action history. The server caps execution at 10 actions and 30 seconds. See [`docs/jev-fast-path.md`](docs/jev-fast-path.md). |
 
 Action kinds:
 
@@ -134,7 +145,10 @@ cargo test    # unit tests + live stdio JSON-RPC tests (need a Hyprland session)
 The integration tests speak raw MCP over the server's stdio: initialize,
 `tools/list`, `computer_monitors`, `computer_observe`, and error variants
 including stale-observation, invalid-coordinate, invalid-modifier, and
-invalid-key rejections for `computer_action`.
+invalid-key rejections for `computer_action`. Fast Path projection, candidate,
+response-validation, browser bridge, and OCR boundary tests are credential-free;
+live Jev accuracy and cross-source latency require a securely configured
+operator environment and are not established by mocked tests.
 
 Live evidence (Hyprland 0.56.2, scale 1.25, fcitx5 IME present):
 

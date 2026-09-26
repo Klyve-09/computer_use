@@ -1,0 +1,41 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 1 ]; then
+  echo "usage: $0 chrome|firefox" >&2
+  exit 2
+fi
+
+browser="$1"
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(CDPATH= cd -- "$script_dir/.." && pwd)"
+case "$browser" in
+  firefox)
+    template="$repo_root/browser/jev-fast-path/native-host/firefox.json.template"
+    host_dir="${HOME:?HOME is required}/.mozilla/native-messaging-hosts"
+    ;;
+  chrome)
+    template="$repo_root/browser/jev-fast-path/native-host/chrome.json.template"
+    host_dir="${HOME:?HOME is required}/.config/google-chrome/NativeMessagingHosts"
+    ;;
+  *) echo "browser must be chrome or firefox" >&2; exit 2 ;;
+esac
+
+manifest="$host_dir/ai.typesafe.computer_use.json"
+if [ -e "$manifest" ]; then
+  echo "native host manifest already exists: $manifest" >&2
+  exit 1
+fi
+mkdir -p "$host_dir"
+python3 - "$template" "$manifest" "$script_dir/computer-use-native-browser-host" <<'PY'
+import json
+import pathlib
+import sys
+
+template, destination, host_path = map(pathlib.Path, sys.argv[1:])
+manifest = json.loads(template.read_text(encoding="utf-8"))
+manifest["path"] = str(host_path.resolve())
+destination.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+destination.chmod(0o600)
+PY
+printf 'Installed native host manifest: %s\n' "$manifest"

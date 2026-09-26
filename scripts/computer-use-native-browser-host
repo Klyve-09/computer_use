@@ -1,0 +1,4 @@
+#!/bin/sh
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+mcp_bin="${COMPUTER_USE_MCP_BIN:-$script_dir/../target/release/computer-use-mcp}"
+exec "$mcp_bin" --native-browser-host "$@"

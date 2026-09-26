@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Computer Use Current Tab Evidence",
+  "version": "0.1.0",
+  "description": "Share bounded visible tab controls with the local Computer Use MCP after an explicit user action.",
+  "minimum_chrome_version": "102",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0HsMComlZ5IyLtXlyO4OUfy0ppBLHDlgqu3pd34vz405Se3uKEgM/fwCII157RzoG5/dboSUpHg7IKm9J+9lBWBYnCmhbuayxyGd1Npf1aT3tqeE445aZXt7szV2xPpD2dLGBloVKsM0byNJs+t4JG0pQPMz0g8xMgDnQ0ldPiAA4L+nlJ1fWvb1uz1K5OBZZukC3UjxVBvpcAhncae1JM1ZGnx5nlEK+NyLBdzUUsYz6gm74VaH2WXIPQpHeBUj954ZnyCPG7qJKLlYkZcMlL/FLDtbWB6k1hsIY9IL7c4Ys29mokidYBDrfDNl8VevZrGrNOsZ4krO7MX2XM4sMwIDAQAB",
+  "permissions": ["activeTab", "scripting", "nativeMessaging"],
+  "action": {
+    "default_title": "Enable Computer Use evidence for this tab"
+  },
+  "background": {
+    "service_worker": "background.js"
+  }
+}

@@ -1,0 +1,22 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 1 ]; then
+  echo "usage: $0 chrome|firefox" >&2
+  exit 2
+fi
+
+browser="$1"
+case "$browser" in
+  chrome|firefox) ;;
+  *) echo "browser must be chrome or firefox" >&2; exit 2 ;;
+esac
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(CDPATH= cd -- "$script_dir/.." && pwd)"
+package_dir="$repo_root/target/jev-fast-path/$browser"
+mkdir -p "$package_dir"
+cp "$repo_root/browser/jev-fast-path/background.js" "$package_dir/background.js"
+cp "$repo_root/browser/jev-fast-path/content.js" "$package_dir/content.js"
+cp "$repo_root/browser/jev-fast-path/manifest.$browser.json" "$package_dir/manifest.json"
+printf '%s\n' "$package_dir"
