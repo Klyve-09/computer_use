@@ -5,7 +5,7 @@ Tools that let an AI assistant interact with the user's computer to carry out re
 ## Language
 
 **Computer Use MCP**:
-The computer-control tool service exposed to an AI assistant. It is the project's deliverable; the assistant consuming its tools supplies the task-level decisions.
+The computer-control tool service exposed to an AI assistant. The assistant supplies task-level decisions and may delegate a bounded Goal to the service.
 _Avoid_: Autonomous agent, assistant application
 
 **Desktop**:
@@ -31,3 +31,19 @@ _Avoid_: Resolution alone
 **Cross-monitor Drag**:
 A single drag action whose starting and ending points are on different monitors.
 _Avoid_: Two separate drags
+
+**Goal**:
+A small result delegated by the assistant, with a limited scope of permitted interactions and an observable completion condition.
+_Avoid_: Unrestricted task, arbitrary autonomous workflow
+
+**UI Evidence**:
+Information about visible controls or text in the current Desktop that supplements an Observation when choosing an Action.
+_Avoid_: Observation, proof that an action is safe
+
+**Action Candidate**:
+A specific permitted interaction grounded in current UI Evidence, from which the next Action may be selected.
+_Avoid_: Invented coordinate, unrestricted instruction
+
+**Fast Path**:
+Bounded execution of a Goal without returning to the assistant for every Action. It returns control when it cannot establish a safe next step or verify progress.
+_Avoid_: Universal application support, autonomous assistant

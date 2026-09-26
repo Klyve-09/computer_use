@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Computer Use Current Tab Evidence",
+  "version": "0.1.0",
+  "description": "Share bounded visible tab controls with the local Computer Use MCP after an explicit user action.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "jev-fast-path@computer-use.local",
+      "strict_min_version": "128.0"
+    }
+  },
+  "permissions": ["activeTab", "scripting", "nativeMessaging"],
+  "action": {
+    "default_title": "Enable Computer Use evidence for this tab"
+  },
+  "background": {
+    "scripts": ["background.js"]
+  }
+}
